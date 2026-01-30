@@ -13,6 +13,7 @@
 @Description: 智能跟单机器人 (集成版 + 邮件通知)
 """
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()  # 显式加载，确保 os.getenv 能读到数据
@@ -210,7 +211,7 @@ class PortfolioManager:
         if success:
             self.portfolio[token_mint]['my_balance'] -= amount_to_sell
 
-            # --- 发送卖出邮件 ---
+            # 邮件通知
             msg = f"检测到聪明钱卖出，已跟随卖出。\n\n代币: {token_mint}\n数量: {amount_to_sell}\n比例: {sell_ratio:.1%}"
             asyncio.create_task(send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg))
 
@@ -218,41 +219,64 @@ class PortfolioManager:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
 
+    # 🔥🔥🔥【新增】同步兜底任务：防止断网漏单 🔥🔥🔥
+    async def monitor_sync_positions(self):
+        logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
+        while self.is_running:
+                if not self.portfolio:
+                    await asyncio.sleep(5)
+                    continue
+
+                # 遍历我当前持有的所有币
+                for token_mint in list(self.portfolio.keys()):
+                    try:
+                        my_data = self.portfolio[token_mint]
+                        if my_data['my_balance'] <= 0: continue
+
+                        # 1. 查大佬现在有多少币 (走 HTTP RPC，不依赖 WebSocket)
+                        sm_balance = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
+
+                        # 2. 检查：大佬是不是已经跑路了？
+                        # 如果大佬余额 < 1 (或者一个极小值)，说明他已经清仓了
+                        if sm_balance < 1:
+                            logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... 但大佬余额为 0！(可能是断网漏了卖单)")
+                            logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
+
+                            # 强制清仓逻辑
+                            await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)  # ROI 瞎填一个即可
+                    except Exception as e:
+                        logger.error(f"同步检查异常: {e}")
+
+                # 每 20 秒查一次岗
+                await asyncio.sleep(20)
+
     async def monitor_1000x_profit(self):
         logger.info("💰 收益监控线程已启动...")
-
-        # 优化：在循环外创建 Session，复用连接池
         async with aiohttp.ClientSession(trust_env=True) as session:
             while self.is_running:
                 if not self.portfolio:
                     await asyncio.sleep(5)
                     continue
 
-                # 复制 keys 防止迭代时字典变化
                 for token_mint in list(self.portfolio.keys()):
                     try:
                         data = self.portfolio[token_mint]
-                        if data['my_balance'] <= 0: continue
+                        if data['my_balance'] <= 0:
+                            continue
 
-                        # 复用 session，速度更快
                         quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
                                                             data['my_balance'])
 
                         if quote:
                             curr_val = int(quote['outAmount'])
-                            # 避免除以零错误
                             cost = data['cost_sol']
                             roi = (curr_val / cost) - 1 if cost > 0 else 0
-
-                            # 打印日志方便观察心跳
-                            # logger.info(f"👀 盯盘: {token_mint[:6]}... 当前收益: {roi*100:.2f}%")
 
                             if roi >= TAKE_PROFIT_ROI:
                                 logger.warning(f"🚀 触发 {roi * 100:.0f}% 止盈！{token_mint} 强平！")
                                 await self.force_sell_all(token_mint, data['my_balance'], roi)
                     except Exception as e:
                         logger.error(f"盯盘异常: {e}")
-
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
@@ -260,9 +284,15 @@ class PortfolioManager:
             token_mint, self.trader.SOL_MINT, amount, SLIPPAGE_SELL
         )
         if success:
-            # --- 发送强平邮件 ---
-            msg = f"触发 1000% 止盈核按钮！\n\n代币: {token_mint}\n当前收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
-            asyncio.create_task(send_email_async(f"🚀 暴富止盈: {token_mint[:6]}...", msg))
+            # 区分一下是止盈还是防断网风控
+            if roi == -0.99:
+                subject = f"🛡️ 防断网风控: {token_mint[:6]}..."
+                msg = f"检测到聪明钱已清仓(可能漏了WebSocket信号)，机器人已补救卖出。\n\n代币: {token_mint}"
+            else:
+                subject = f"🚀 暴富止盈: {token_mint[:6]}..."
+                msg = f"触发 1000% 止盈核按钮！\n\n代币: {token_mint}\n当前收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
+
+            asyncio.create_task(send_email_async(subject, msg))
 
             if token_mint in self.portfolio:
                 del self.portfolio[token_mint]
@@ -386,11 +416,11 @@ async def main():
     # 2. 初始化仓位管理器
     pm = PortfolioManager(trader)
 
-    # 3. 并发运行：收益监控 + WebSocket 监听
-    # 使用 gather 同时运行两个死循环任务
+    # 3. 并发运行：收益监控 + WebSocket 监听 + 【新增】持仓同步
     await asyncio.gather(
-        pm.monitor_1000x_profit(),
-        start_monitor(pm)
+        pm.monitor_1000x_profit(),  # 负责赚大钱 (10倍止盈)
+        pm.monitor_sync_positions(),  # 负责保命 (防断网兜底)
+        start_monitor(pm)  # 负责跟单 (WebSocket)
     )
 
 
