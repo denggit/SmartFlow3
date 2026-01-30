@@ -13,11 +13,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- 代理设置 (最优先) ---
-PROXY_URL = "http://127.0.0.1:7890"
-os.environ["HTTP_PROXY"] = PROXY_URL
-os.environ["HTTPS_PROXY"] = PROXY_URL
-
 # --- API Keys ---
 API_KEY = os.getenv("API_KEY")
 TARGET_WALLET = os.getenv("TARGET_WALLET")
