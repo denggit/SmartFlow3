@@ -64,8 +64,8 @@ class SolanaTrader:
             raise ValueError("❌ 未找到私钥，请在 .env 或 config/settings.py 中配置 PRIVATE_KEY")
 
         self.payer = Keypair.from_base58_string(PRIVATE_KEY)
-        self.JUP_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-        self.JUP_SWAP_API = "https://quote-api.jup.ag/v6/swap"
+        self.JUP_QUOTE_API = "https://lite-api.jup.ag/v6/quote"
+        self.JUP_SWAP_API = "https://lite-api.jup.ag/v6/swap"
         self.SOL_MINT = "So11111111111111111111111111111111111111112"
 
         logger.info(f"💳 交易钱包已加载: {self.payer.pubkey()}")
