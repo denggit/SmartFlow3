@@ -168,20 +168,37 @@ async def check_token_liquidity(session, token_mint):
 
 
 # ================= 模块：仓位管理 =================
+# main.py 中的 PortfolioManager 类 (更新版)
+
 class PortfolioManager:
     def __init__(self, trader: SolanaTrader):
         self.trader = trader
         self.portfolio = {}
+        self.trade_history = []  # 🔥 新增：历史交易记录 (用于日报)
         self.is_running = True
+
+    def _record_history(self, action, token, amount, value_sol):
+        """ 内部方法：记录交易历史 """
+        self.trade_history.append({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "token": token,
+            "amount": amount,
+            "value_sol": value_sol
+        })
 
     def add_position(self, token_mint, amount_bought, cost_sol):
         if token_mint not in self.portfolio:
             self.portfolio[token_mint] = {'my_balance': 0, 'cost_sol': 0}
         self.portfolio[token_mint]['my_balance'] += amount_bought
         self.portfolio[token_mint]['cost_sol'] += cost_sol
+
+        # 记录历史
+        self._record_history("BUY", token_mint, amount_bought, cost_sol)
         logger.info(f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']}")
 
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
+        # ... (检查持仓逻辑不变) ...
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
             logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 但我未持有，跳过。")
             return
@@ -201,7 +218,7 @@ class PortfolioManager:
         if amount_to_sell < 100: return
 
         logger.info(f"📉 跟随卖出: {amount_to_sell} (占持仓 {sell_ratio:.2%})")
-        success, _ = await self.trader.execute_swap(
+        success, est_sol_out = await self.trader.execute_swap(
             input_mint=token_mint,
             output_mint=self.trader.SOL_MINT,
             amount_lamports=amount_to_sell,
@@ -211,6 +228,9 @@ class PortfolioManager:
         if success:
             self.portfolio[token_mint]['my_balance'] -= amount_to_sell
 
+            # 记录历史 (est_sol_out 是大概回来的 SOL 数量)
+            self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
+
             # 邮件通知
             msg = f"检测到聪明钱卖出，已跟随卖出。\n\n代币: {token_mint}\n数量: {amount_to_sell}\n比例: {sell_ratio:.1%}"
             asyncio.create_task(send_email_async(f"📉 跟随卖出成功: {token_mint[:6]}...", msg))
@@ -219,59 +239,44 @@ class PortfolioManager:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
 
-    # 🔥🔥🔥【新增】同步兜底任务：防止断网漏单 🔥🔥🔥
     async def monitor_sync_positions(self):
+        # ... (原有防断网逻辑保持不变) ...
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
         while self.is_running:
-                if not self.portfolio:
-                    await asyncio.sleep(5)
-                    continue
-
-                # 遍历我当前持有的所有币
-                for token_mint in list(self.portfolio.keys()):
-                    try:
-                        my_data = self.portfolio[token_mint]
-                        if my_data['my_balance'] <= 0: continue
-
-                        # 1. 查大佬现在有多少币 (走 HTTP RPC，不依赖 WebSocket)
-                        sm_balance = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
-
-                        # 2. 检查：大佬是不是已经跑路了？
-                        # 如果大佬余额 < 1 (或者一个极小值)，说明他已经清仓了
-                        if sm_balance < 1:
-                            logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... 但大佬余额为 0！(可能是断网漏了卖单)")
-                            logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
-
-                            # 强制清仓逻辑
-                            await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)  # ROI 瞎填一个即可
-                    except Exception as e:
-                        logger.error(f"同步检查异常: {e}")
-
-                # 每 20 秒查一次岗
-                await asyncio.sleep(20)
+            if not self.portfolio:
+                await asyncio.sleep(5)
+                continue
+            for token_mint in list(self.portfolio.keys()):
+                try:
+                    my_data = self.portfolio[token_mint]
+                    if my_data['my_balance'] <= 0: continue
+                    sm_balance = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
+                    if sm_balance < 1:
+                        logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... 但大佬余额为 0！")
+                        logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
+                        await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)
+                except Exception as e:
+                    logger.error(f"同步检查异常: {e}")
+            await asyncio.sleep(20)
 
     async def monitor_1000x_profit(self):
+        # ... (原有止盈逻辑保持不变) ...
         logger.info("💰 收益监控线程已启动...")
         async with aiohttp.ClientSession(trust_env=True) as session:
             while self.is_running:
                 if not self.portfolio:
                     await asyncio.sleep(5)
                     continue
-
                 for token_mint in list(self.portfolio.keys()):
                     try:
                         data = self.portfolio[token_mint]
-                        if data['my_balance'] <= 0:
-                            continue
-
+                        if data['my_balance'] <= 0: continue
                         quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
                                                             data['my_balance'])
-
                         if quote:
                             curr_val = int(quote['outAmount'])
                             cost = data['cost_sol']
                             roi = (curr_val / cost) - 1 if cost > 0 else 0
-
                             if roi >= TAKE_PROFIT_ROI:
                                 logger.warning(f"🚀 触发 {roi * 100:.0f}% 止盈！{token_mint} 强平！")
                                 await self.force_sell_all(token_mint, data['my_balance'], roi)
@@ -280,22 +285,116 @@ class PortfolioManager:
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
-        success, _ = await self.trader.execute_swap(
+        success, est_sol_out = await self.trader.execute_swap(
             token_mint, self.trader.SOL_MINT, amount, SLIPPAGE_SELL
         )
         if success:
-            # 区分一下是止盈还是防断网风控
+            # 记录历史
+            self._record_history("SELL_FORCE", token_mint, amount, est_sol_out)
+
             if roi == -0.99:
                 subject = f"🛡️ 防断网风控: {token_mint[:6]}..."
-                msg = f"检测到聪明钱已清仓(可能漏了WebSocket信号)，机器人已补救卖出。\n\n代币: {token_mint}"
+                msg = f"检测到聪明钱已清仓，机器人已补救卖出。\n\n代币: {token_mint}"
             else:
                 subject = f"🚀 暴富止盈: {token_mint[:6]}..."
-                msg = f"触发 1000% 止盈核按钮！\n\n代币: {token_mint}\n当前收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
+                msg = f"触发 1000% 止盈！\n\n代币: {token_mint}\n收益率: {roi * 100:.1f}%\n动作: 全仓卖出"
 
             asyncio.create_task(send_email_async(subject, msg))
-
             if token_mint in self.portfolio:
                 del self.portfolio[token_mint]
+
+    # 🔥🔥🔥【新增】每日日报生成器 🔥🔥🔥
+    async def schedule_daily_report(self):
+        logger.info("📅 日报调度器已启动 (每天 09:00 发送)...")
+        while self.is_running:
+            now = datetime.now()
+            # 设定目标时间：今天的 09:00:00
+            target_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+
+            # 如果今天已经过了 9点，就定在明天 9点
+            if now >= target_time:
+                from datetime import timedelta
+                target_time += timedelta(days=1)
+
+            # 计算还要睡多久 (秒)
+            sleep_seconds = (target_time - now).total_seconds()
+            logger.info(f"⏳ 距离发送日报还有 {sleep_seconds / 3600:.1f} 小时")
+
+            # 睡觉等待
+            await asyncio.sleep(sleep_seconds)
+
+            # 醒来！开始干活
+            await self.send_daily_summary()
+
+            # 睡一小会儿防止重复触发
+            await asyncio.sleep(60)
+
+    async def send_daily_summary(self):
+        logger.info("📊 正在生成每日日报...")
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            try:
+                # 1. 获取 SOL 价格 (USDC)
+                # Jup Quote: 1 SOL -> USDC
+                usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
+                sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
+
+                # 2. 查询钱包 SOL 余额
+                balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
+                sol_balance = balance_resp.value / 10 ** 9
+
+                # 3. 计算持仓总价值 (SOL)
+                holdings_val_sol = 0
+                holdings_details = ""
+
+                if self.portfolio:
+                    for mint, data in self.portfolio.items():
+                        qty = data['my_balance']
+                        if qty > 0:
+                            # 询价
+                            q = await self.trader.get_quote(session, mint, self.trader.SOL_MINT, qty)
+                            val = int(q['outAmount']) / 10 ** 9 if q else 0
+                            holdings_val_sol += val
+                            holdings_details += f"- {mint[:6]}...: 持有 {qty}, 价值 {val:.2f} SOL\n"
+
+                total_asset_sol = sol_balance + holdings_val_sol
+                total_asset_usd = total_asset_sol * sol_price
+
+                # 4. 统计昨日交易
+                # 这里简单统计一下 trade_history 里的条数
+                buy_count = sum(1 for x in self.trade_history if x['action'] == 'BUY')
+                sell_count = sum(1 for x in self.trade_history if 'SELL' in x['action'])
+
+                # 5. 生成报告文本
+                report = f"""
+【📅 每日交易与资产报告】
+时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+💰 资产概览:
+-------------------
+• SOL 价格: ${sol_price:.2f}
+• 钱包余额: {sol_balance:.4f} SOL
+• 持仓价值: {holdings_val_sol:.4f} SOL
+• 总计资产: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.2f})
+
+📊 交易统计 (累计):
+-------------------
+• 买入次数: {buy_count}
+• 卖出次数: {sell_count}
+
+👜 当前持仓明细:
+{holdings_details if holdings_details else "(空仓)"}
+
+🤖 机器人状态: 正常运行中
+"""
+                # 发送
+                await send_email_async("📊 [日报] 资产与交易总结", report)
+
+                # (可选) 清空历史记录，或者保留做累计
+                # self.trade_history.clear()
+
+            except Exception as e:
+                logger.error(f"生成日报失败: {e}")
 
 
 # ================= 辅助模块：交易解析 =================
@@ -416,11 +515,12 @@ async def main():
     # 2. 初始化仓位管理器
     pm = PortfolioManager(trader)
 
-    # 3. 并发运行：收益监控 + WebSocket 监听 + 【新增】持仓同步
+    # 3. 并发运行所有任务
     await asyncio.gather(
-        pm.monitor_1000x_profit(),  # 负责赚大钱 (10倍止盈)
-        pm.monitor_sync_positions(),  # 负责保命 (防断网兜底)
-        start_monitor(pm)  # 负责跟单 (WebSocket)
+        pm.monitor_1000x_profit(),  # 止盈
+        pm.monitor_sync_positions(),  # 防断网
+        pm.schedule_daily_report(),  # 🔥 新增：每日日报
+        start_monitor(pm)  # 监听
     )
 
 
