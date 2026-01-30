@@ -1,0 +1,17 @@
+# Solana 交易机器人依赖包
+# Python 版本要求: >= 3.8
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# 异步 HTTP 客户端
+aiohttp>=3.9.0
+httpx>=0.25.0
+
+# WebSocket 客户端
+websockets>=12.0
+
+# Solana 区块链 SDK
+solana>=0.30.0
+solders>=0.18.0
+
