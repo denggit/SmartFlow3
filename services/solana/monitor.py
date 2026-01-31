@@ -39,8 +39,18 @@ async def fetch_transaction_details(session, signature):
 
 def parse_tx(tx_data):
     if not tx_data: return None
+    
+    # 1. 获取转账数据
     token_transfers = tx_data.get('tokenTransfers', [])
-    trade_info = {"action": "UNKNOWN", "token_address": None, "amount": 0}
+    native_transfers = tx_data.get('nativeTransfers', []) # 🔥 新增：获取 SOL 转账记录
+    
+    # 初始化返回结构，新增 sol_spent 字段
+    trade_info = {
+        "action": "UNKNOWN", 
+        "token_address": None, 
+        "amount": 0,
+        "sol_spent": 0.0  # 🔥 新增：记录这笔交易花了多少 SOL
+    }
 
     out_tokens = []
     in_tokens = []
@@ -54,14 +64,26 @@ def parse_tx(tx_data):
 
     for tx in token_transfers:
         mint = tx['mint']
-        if mint in IGNORE_MINTS: continue  # 🔥 遇到稳定币直接跳过
+        if mint in IGNORE_MINTS: continue
 
         if tx['fromUserAccount'] == TARGET_WALLET:
             out_tokens.append((mint, tx['tokenAmount']))
         elif tx['toUserAccount'] == TARGET_WALLET:
             in_tokens.append((mint, tx['tokenAmount']))
 
-    # (原本的判断逻辑保持不变...)
+    # 🔥🔥🔥 新增：计算 SOL 变动 (判断大哥花了多少钱) 🔥🔥🔥
+    sol_change = 0
+    for nt in native_transfers:
+        if nt['fromUserAccount'] == TARGET_WALLET:
+            sol_change -= nt['amount'] # 流出 (花钱)
+        elif nt['toUserAccount'] == TARGET_WALLET:
+            sol_change += nt['amount'] # 流入 (收钱)
+            
+    # 如果 sol_change 是负数，说明是净流出（买入成本）
+    if sol_change < 0:
+        trade_info['sol_spent'] = abs(sol_change) / 10**9
+    # -----------------------------------------------------
+
     if in_tokens:
         trade_info['action'] = "BUY"
         trade_info['token_address'] = in_tokens[0][0]
