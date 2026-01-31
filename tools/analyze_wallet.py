@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 @File       : analyze_wallet.py
-@Description: 大哥筛选器 (最终版) - 增加中位数、秒男率、风险评分
+@Description: 智能钱包画像识别 (自动判断大哥类型)
 """
 import asyncio
 import os
 import sys
+import argparse
 from collections import defaultdict
 import statistics
 import aiohttp
@@ -15,20 +16,19 @@ import aiohttp
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import API_KEY
 
-# === ⚙️ 配置区 ===
-TARGET_TX_COUNT = 20000  # 建议拉取 1000 条以获得准确数据
-MIN_SOL_THRESHOLD = 0.1  # 忽略小于 0.1 SOL 的粉尘交易
-
+# === ⚙️ 基础配置 ===
+TARGET_TX_COUNT = 20000 
+MIN_SOL_THRESHOLD = 0.1 
 
 # =================
 
-async def fetch_history_pagination(session, address, max_count=500):
+async def fetch_history_pagination(session, address, max_count=1000):
     """ 自动翻页拉取交易记录 """
     all_txs = []
     last_signature = None
 
-    print(f"🔍 正在深度审计: {address[:6]}...")
-    print(f"🎯 目标样本: {max_count} 条 (正在挖掘数据...)")
+    print(f"🔍 正在深度审计: {address[:6]}... (自动画像中)")
+    print(f"🎯 目标样本: {max_count} 条 (挖掘数据...)")
 
     while len(all_txs) < max_count:
         batch_limit = 100
@@ -38,29 +38,30 @@ async def fetch_history_pagination(session, address, max_count=500):
 
         try:
             async with session.get(url, params=params) as resp:
-                if resp.status != 200: break
+                if resp.status != 200: 
+                    print(f"❌ API 错误: {resp.status}")
+                    break
                 data = await resp.json()
                 if not data: break
 
                 all_txs.extend(data)
                 last_signature = data[-1].get('signature')
-                print(f"  -> 已获取 {len(all_txs)} / {max_count}...")
+                # print(f"  -> 已获取 {len(all_txs)} / {max_count}...") # 减少刷屏
 
                 if len(data) < batch_limit: break
-                await asyncio.sleep(0.2)
-        except Exception:
+                await asyncio.sleep(0.1) #稍微快一点
+        except Exception as e:
+            print(f"❌ 网络异常: {e}")
             break
 
     return all_txs[:max_count]
 
 
 def parse_trades(transactions, target_wallet):
-    """ 解析交易流 (增加金额过滤) """
+    """ 解析交易流 """
     positions = defaultdict(list)
     closed_trades = []
-
-    IGNORE_MINTS = ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]
+    IGNORE_MINTS = ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]
 
     for tx in reversed(transactions):
         if 'tokenTransfers' not in tx: continue
@@ -79,8 +80,6 @@ def parse_trades(transactions, target_wallet):
             if tt['toUserAccount'] == target_wallet: token_change += amt
 
         if not token_mint or token_change == 0: continue
-
-        # 过滤掉金额过小的噪音交易
         if abs(sol_change) < 0.01 and sol_change != 0: continue
 
         if token_change > 0 and sol_change < 0:  # BUY
@@ -89,8 +88,6 @@ def parse_trades(transactions, target_wallet):
         elif token_change < 0 and sol_change > 0:  # SELL
             if token_mint in positions and positions[token_mint]:
                 open_pos = positions[token_mint].pop(0)
-
-                # 再次过滤：如果买入成本太低，不计入统计
                 if open_pos['cost_sol'] < MIN_SOL_THRESHOLD: continue
 
                 hold_time = (timestamp - open_pos['time']) / 60
@@ -108,35 +105,37 @@ def parse_trades(transactions, target_wallet):
     return closed_trades
 
 
-def calculate_score(win_rate, median_hold, sniper_rate, profit):
-    """ 🤖 AI 评分算法 """
+def calculate_score_for_mode(mode, win_rate, median_hold, sniper_rate, profit, max_roi):
+    """ 针对特定模式打分 """
     score = 100
-    reasons = []
+    
+    if mode == 'conservative': # 稳健型：看胜率、怕回撤
+        if win_rate < 0.5: score -= 30
+        elif win_rate < 0.6: score -= 10
+        if median_hold < 10: score -= 30
+        if profit < 0: score -= 50
+        if sniper_rate > 0.2: score -= 20
 
-    # 1. 胜率惩罚
-    if win_rate < 0.4:
-        score -= 30; reasons.append("胜率过低")
-    elif win_rate < 0.5:
-        score -= 15
+    elif mode == 'aggressive': # 激进型：看暴击、不怕输
+        if max_roi < 5.0: score -= 40
+        if win_rate < 0.3: score -= 20
+        if profit < 0 and max_roi < 10.0: score -= 30
+        if sniper_rate > 0.5: score -= 5 # 稍微扣一点
 
-    # 2. 持仓时间惩罚 (核心)
-    if median_hold < 5:
-        score -= 40; reasons.append("典型的秒男(PVP)")
-    elif median_hold < 30:
-        score -= 20; reasons.append("持仓过短")
+    elif mode == 'diamond': # 钻石手：看时间
+        if median_hold < 60: score -= 50
+        elif median_hold < 1440: score -= 10
+        if max_roi < 3.0: score -= 20
+        if sniper_rate > 0.1: score -= 30
 
-    # 3. 秒男率惩罚
-    if sniper_rate > 0.3: score -= 20; reasons.append("高频刷单嫌疑")
-
-    # 4. 盈利惩罚
-    if profit < 0: score -= 20; reasons.append("总账户亏损")
-
-    return max(0, score), ", ".join(reasons)
+    return max(0, score)
 
 
 async def main():
-    if len(sys.argv) < 2: return
-    target = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Auto Identity Analyzer")
+    parser.add_argument("wallet", help="Target Wallet Address")
+    args = parser.parse_args()
+    target = args.wallet
 
     async with aiohttp.ClientSession() as session:
         txs = await fetch_history_pagination(session, target, TARGET_TX_COUNT)
@@ -144,52 +143,79 @@ async def main():
         trades = parse_trades(txs, target)
         if not trades: print("⚠️ 无有效交易数据"); return
 
-        # === 核心统计 ===
+        # === 1. 基础数据计算 ===
         count = len(trades)
         wins = [t for t in trades if t['roi'] > 0]
-        losses = [t for t in trades if t['roi'] <= 0]
         total_profit = sum(t['profit'] for t in trades)
-
-        # 统计分布
+        
         hold_times = [t['hold_time'] for t in trades]
-        avg_hold = statistics.mean(hold_times)
-        median_hold = statistics.median(hold_times)  # 中位数
-
-        # 秒男率 (持仓 < 2分钟的比例)
+        median_hold = statistics.median(hold_times) if hold_times else 0
+        
         sniper_txs = [t for t in trades if t['hold_time'] < 2]
         sniper_rate = len(sniper_txs) / count
-
-        # 评分
+        
         win_rate = len(wins) / count
-        score, reason = calculate_score(win_rate, median_hold, sniper_rate, total_profit)
+        max_roi = max([t['roi'] for t in trades]) if trades else 0
 
-        # === 输出报告 ===
-        print("\n" + "=" * 50)
-        print(f"🧬 钱包深度透视报告: {target[:6]}...")
-        print("=" * 50)
-        print(f"📊 样本分析: {count} 笔有效交易 (已过滤 < {MIN_SOL_THRESHOLD} SOL 的粉尘单)")
-        print(f"💰 净盈利: {total_profit:+.2f} SOL")
-        print(f"🏆 真实胜率: {win_rate:.1%}")
-        print("-" * 30)
-        print(f"⏳ 持仓时间分析 (关键):")
-        print(f"   • 平均值: {avg_hold:.1f} 分钟 (易受干扰)")
-        print(f"   • 中位数: {median_hold:.1f} 分钟 (真实水平) 🔥")
-        print(f"   • 秒男率: {sniper_rate:.1%} (持仓<2分钟的比例)")
-        print("-" * 30)
+        # === 2. 三维雷达扫描 ===
+        scores = {
+            "🛡️ 稳健中军": calculate_score_for_mode('conservative', win_rate, median_hold, sniper_rate, total_profit, max_roi),
+            "⚔️ 土狗猎手": calculate_score_for_mode('aggressive', win_rate, median_hold, sniper_rate, total_profit, max_roi),
+            "💎 钻石之手": calculate_score_for_mode('diamond', win_rate, median_hold, sniper_rate, total_profit, max_roi)
+        }
 
-        print(f"\n📢 最终判定: {score} 分")
-        if score >= 80:
-            print(f"✅ [强烈推荐] 真正的波段高手！ (理由: 各项指标健康)")
-        elif score >= 60:
-            print(f"⚠️ [谨慎跟单] 有一定风险。 (扣分项: {reason})")
+        # 找出最高分
+        best_role, best_score = max(scores.items(), key=lambda item: item[1])
+
+        # === 3. 最终判决 ===
+        verdict = ""
+        suggestion = ""
+        
+        if total_profit < 0 and best_score < 60:
+            verdict = "🥬 纯纯的韭菜"
+            suggestion = "❌ 千万别跟！这是反向指标！"
+        elif best_score < 60:
+            verdict = "🤔 风格不明/菜鸟"
+            suggestion = "⚠️ 暂不推荐，特征不明显。"
         else:
-            print(f"❌ [严重警告] 千万别跟！ (致命伤: {reason})")
+            verdict = f"{best_role} (匹配度 {best_score}%)"
+            if "稳健" in best_role:
+                suggestion = "✅ 建议放入 [Bot B] (大资金、低倍止盈)"
+            elif "土狗" in best_role:
+                suggestion = "✅ 建议放入 [Bot A] (小资金、高倍止盈)"
+            elif "钻石" in best_role:
+                suggestion = "✅ 建议放入 [Bot C] (特定策略、长线)"
 
-        print("\n📝 最近 5 笔交易快照:")
-        for t in trades[-5:]:
-            icon = "🟢" if t['roi'] > 0 else "🔴"
-            print(f" {icon} 持仓 {t['hold_time']:.1f}m | 投入 {t['cost']:.1f} | ROI {t['roi'] * 100:+.1f}%")
+        # === 4. 输出可视化报告 ===
+        print("\n" + "═" * 50)
+        print(f"🧬 钱包身份识别报告: {target[:6]}...{target[-4:]}")
+        print("═" * 50)
+        
+        print(f"📊 核心数据:")
+        print(f"   • 总盈亏: {'+' if total_profit>0 else ''}{total_profit:.2f} SOL")
+        print(f"   • 胜  率: {win_rate:.1%}")
+        print(f"   • 最高单: {max_roi*100:.0f}% (最大暴击)")
+        print(f"   • 持  仓: {median_hold:.1f} 分钟 (中位数)")
+        
+        print("-" * 30)
+        print(f"🎯 身份画像 (雷达图):")
+        for role, sc in scores.items():
+            bar = "█" * (sc // 10) + "░" * ((100 - sc) // 10)
+            print(f"   {role}: {bar} {sc}")
+            
+        print("-" * 30)
+        print(f"📢 最终判定: {verdict}")
+        print(f"💡 战术建议: {suggestion}")
+        print("═" * 50)
 
+        if count > 0:
+            print("\n📝 最近 3 笔实战:")
+            for t in trades[-3:]:
+                icon = "🟢" if t['roi'] > 0 else "🔴"
+                print(f" {icon} 持仓 {t['hold_time']:>5.1f}m | 投入 {t['cost']:>5.2f} | ROI {t['roi'] * 100:>+6.1f}%")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
