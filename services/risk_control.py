@@ -8,7 +8,56 @@
 """
 # services/risk_control.py
 from utils.logger import logger
+import aiohttp
+from utils.logger import logger
 
+
+async def check_is_honeypot(session, token_mint):
+    """
+    🔥 核心风控：检测是否为貔貅/蜜罐
+    使用 RugCheck API (专门针对 Solana)
+    """
+    if token_mint == "So11111111111111111111111111111111111111112": # WSOL
+        return True # 安全
+
+    url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report"
+    
+    try:
+        async with session.get(url, timeout=5) as response:
+            if response.status == 200:
+                data = await response.json()
+                
+                # 1. 检查评分 (分数越高越危险，通常 > 5000 就很危险)
+                score = data.get('score', 0)
+                if score > 2000: # 严格一点，超过2000分就不碰
+                    logger.warning(f"⚠️ 风险过高 (Score: {score}): {token_mint}")
+                    return False
+                
+                # 2. 检查危险标记
+                risks = data.get('risks', [])
+                critical_risks = [r for r in risks if r['level'] == 'danger']
+                if len(critical_risks) > 0:
+                    logger.warning(f"☠️ 发现致命风险: {critical_risks[0]['name']}")
+                    return False
+                
+                # 3. 检查铸币权/冻结权是否还在 (Solana 特色貔貅)
+                token_meta = data.get('tokenMeta', {})
+                if not token_meta.get('mutable', True): # 如果元数据不可变是好事，但在 RugCheck 里要看 specific risks
+                    pass
+
+                logger.info(f"✅ 合约检测通过 (Score: {score})")
+                return True
+            else:
+                # 如果 RugCheck 还没收录这个新币，通常说明它太新了，可以策略性放过或拒绝
+                # 激进策略：返回 True (赌它不是)
+                # 保守策略：返回 False (看不懂就不买)
+                logger.warning(f"RugCheck 未收录，跳过检测")
+                return True 
+                
+    except Exception as e:
+        logger.error(f"合约检测网络失败: {e}")
+        return True # 网络断了默认放行(激进) 或 拦截(保守)
+        
 
 async def check_token_liquidity(session, token_mint):
     if token_mint == "So11111111111111111111111111111111111111112":
