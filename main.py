@@ -10,7 +10,7 @@ import argparse
 import asyncio
 import os
 
-from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST
+from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, MIN_FDV
 from core.portfolio import PortfolioManager
 from services.risk_control import check_token_liquidity, check_is_honeypot
 from services.solana.monitor import start_monitor, parse_tx, fetch_transaction_details
@@ -34,7 +34,6 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
         if smart_money_cost < MIN_SMART_MONEY_COST:
             logger.warning(f"📉 [过滤] 大哥买入金额过小: {smart_money_cost:.4f} SOL < {MIN_SMART_MONEY_COST} SOL，判断为试盘，忽略跟单")
             return
-        # -----------------------------------------------------------
 
         # 1. 基础风控 (貔貅检测等)
         is_safe, liq, fdv = await check_token_liquidity(session, token)
@@ -42,6 +41,21 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
         if not is_safe:
             logger.warning(f"🚫 拦截低流动性代币: {token}")
             return
+
+        # 如果池子太小 (比如 < $3000)，太容易被操控，不跟
+        if liq < MIN_LIQUIDITY_USD:
+            logger.warning(f"💧 [风控拦截] 流动性过低: ${liq:,.0f} < ${MIN_LIQUIDITY_USD:,.0f}")
+            return
+    
+        # 如果市值太小
+        if fdv < MIN_FDV:
+             logger.warning(f"📉 [风控拦截] 市值过小: ${fdv:,.0f} < ${MIN_FDV:,.0f}")
+             return
+    
+        # 如果市值太大 (比如 > 500万)，说明涨不动了，不跟
+        if fdv > MAX_FDV:
+             logger.warning(f"📈 [风控拦截] 市值过大(空间小): ${fdv:,.0f} > ${MAX_FDV:,.0f}")
+             return
 
         is_honeypot = await check_is_honeypot(session, token)
         if not is_honeypot:
