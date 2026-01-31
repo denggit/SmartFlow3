@@ -38,8 +38,8 @@ class PortfolioManager:
         self._load_data()
         self._rebuild_buy_counts_cache()
 
-        # 🔥 新增一把锁
-        self.lock = asyncio.Lock()  
+        # 🔥 字典锁：每个 Token 对应一个独立的锁
+        self.locks = defaultdict(asyncio.Lock)
 
     def _ensure_data_dir(self):
         if not os.path.exists(DATA_DIR):
@@ -122,6 +122,10 @@ class PortfolioManager:
 
     def get_buy_counts(self, token_mint):
         return self.buy_counts_cache.get(token_mint, 0)
+
+    def get_token_lock(self, token_mint):
+        """ 获取指定 Token 的专用锁 """
+        return self.locks[token_mint]
 
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
         if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
