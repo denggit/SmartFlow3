@@ -29,10 +29,10 @@ SLIPPAGE_BUY = 1000
 SLIPPAGE_SELL = 2000
 TAKE_PROFIT_ROI = 10.0
 
-# --- 风控配置 ---
-MIN_LIQUIDITY_USD = 20000
-MAX_FDV = 5000000
-MIN_FDV = 200000
+# --- 风控配置 (跟单模式 - 激进版) ---
+MIN_LIQUIDITY_USD = 3000   # 原来是 20000 -> 改为 3000
+MAX_FDV = 5000000          # 保持不变
+MIN_FDV = 0                # 原来是 200000 -> 改为 0 (只要有池子就跟)
 
 # --- 邮箱配置 ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
