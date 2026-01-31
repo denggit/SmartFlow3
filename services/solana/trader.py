@@ -97,6 +97,26 @@ class SolanaTrader:
         except Exception:
             return 0
 
+    async def get_token_balance_raw(self, wallet_pubkey_str, token_mint_str):
+        """ 🔥 新增：查询余额（返回原始整数，用于精确询价）"""
+        try:
+            if token_mint_str == self.SOL_MINT:
+                resp = await self.rpc_client.get_balance(Pubkey.from_string(wallet_pubkey_str))
+                return int(resp.value)
+
+            opts = TokenAccountOpts(mint=Pubkey.from_string(token_mint_str))
+            resp = await self.rpc_client.get_token_accounts_by_owner(
+                Pubkey.from_string(wallet_pubkey_str), opts
+            )
+            if not resp.value: return 0
+
+            account_pubkey = resp.value[0].pubkey
+            balance_resp = await self.rpc_client.get_token_account_balance(account_pubkey)
+            # 返回原始整数 (例如 1000000 而不是 1.0)
+            return int(balance_resp.value.amount)
+        except Exception:
+            return 0
+
     def _get_proxy(self):
         return os.environ.get("HTTP_PROXY")
 
