@@ -175,32 +175,58 @@ def __init__(self, trader):
     async def monitor_sync_positions(self):
         """
         防断网兜底：每20秒检查一次链上状态
-        这个函数在重启后非常关键！它会读取 portfolio.json 里的币，
-        然后去链上查大佬还在不在。如果大佬在断网期间跑了，这里会立刻触发强平。
+        (升级版：支持粉尘过滤，价值 < 0.05 SOL 视为清仓)
         """
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
-        while self.is_running:
-            if not self.portfolio:
-                await asyncio.sleep(5)
-                continue
+        
+        # 🔥 创建一个 session 用于询价
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            while self.is_running:
+                if not self.portfolio:
+                    await asyncio.sleep(5)
+                    continue
 
-            # 复制一份 keys 防止遍历时修改字典报错
-            for token_mint in list(self.portfolio.keys()):
-                try:
-                    my_data = self.portfolio[token_mint]
-                    if my_data['my_balance'] <= 0: continue
+                for token_mint in list(self.portfolio.keys()):
+                    try:
+                        my_data = self.portfolio[token_mint]
+                        if my_data['my_balance'] <= 0: continue
 
-                    # 查链上余额 (走强制代理的 Trader)
-                    sm_balance = await self.trader.get_token_balance(TARGET_WALLET, token_mint)
+                        # 1. 获取大佬的原始余额 (Raw Integer)
+                        sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
 
-                    # 如果大佬没币了，但我还有，说明漏单了
-                    if sm_balance < 1:
-                        logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... 但大佬余额为 0！")
-                        logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
-                        await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)
-                except Exception as e:
-                    logger.error(f"同步检查异常: {e}")
-            await asyncio.sleep(20)
+                        should_sell = False
+                        reason = ""
+
+                        # 🛑 情况 A: 余额真的是 0
+                        if sm_amount_raw == 0:
+                            should_sell = True
+                            reason = "大佬余额为 0"
+                        
+                        # 🧹 情况 B: 余额 > 0，但可能是粉尘 (Value Check)
+                        else:
+                            # 询价：看看这些币值多少 SOL
+                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, sm_amount_raw)
+                            if quote:
+                                val_in_sol = int(quote['outAmount']) / 10**9
+                                # 🔥 阈值设定：小于 0.05 SOL 视为已清仓
+                                if val_in_sol < 0.05:
+                                    should_sell = True
+                                    reason = f"大佬余额价值仅 {val_in_sol:.4f} SOL (判定为粉尘)"
+                            else:
+                                # 询价失败 (可能池子撤了)，如果这种情况下大佬还没跑，通常说明出事了
+                                # 保守起见，如果无法询价且余额很小，也可以选择卖出，这里暂不处理，避免是因为网络问题导致的询价失败（当前老有这毛病）
+                                pass
+
+                        # 🚀 触发强平
+                        if should_sell:
+                            logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... | 原因: {reason}")
+                            logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
+                            await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)
+
+                    except Exception as e:
+                        logger.error(f"同步检查异常: {e}")
+                
+                await asyncio.sleep(20)
 
     async def monitor_1000x_profit(self):
         """ 止盈监控 """
