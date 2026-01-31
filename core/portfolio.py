@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 @File       : core/portfolio.py
-@Description: 核心资产管理 (支持断电记忆/持久化保存 + 每日盈亏统计)
+@Description: 核心资产管理 (支持断电记忆/持久化保存 + 智能去灰尘胜率统计)
 """
 import asyncio
 import json
 import os
 import aiohttp
-from datetime import datetime, timedelta  # 🔥 新增 timedelta
+from datetime import datetime, timedelta
 
 # 导入配置和工具
 from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI
@@ -153,10 +153,9 @@ class PortfolioManager:
             if self.portfolio[token_mint]['my_balance'] < 100:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
-
-                # 尝试关闭账户回血
+                
                 logger.info(f"🧹 正在尝试回收账户租金...")
-                await asyncio.sleep(2)
+                await asyncio.sleep(2) 
                 asyncio.create_task(self.trader.close_token_account(token_mint))
 
             self._save_portfolio()  # 保存
@@ -169,7 +168,7 @@ class PortfolioManager:
     async def monitor_sync_positions(self):
         """ 防断网兜底：检查链上状态与粉尘过滤 """
         logger.info("🛡️ 持仓同步防断网线程已启动 (每20秒检查一次)...")
-
+        
         async with aiohttp.ClientSession(trust_env=False) as session:
             while self.is_running:
                 if not self.portfolio:
@@ -191,10 +190,9 @@ class PortfolioManager:
                             reason = "大佬余额为 0"
                         else:
                             # 价值检查 (Value Check)
-                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
-                                                                sm_amount_raw)
+                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT, sm_amount_raw)
                             if quote:
-                                val_in_sol = int(quote['outAmount']) / 10 ** 9
+                                val_in_sol = int(quote['outAmount']) / 10**9
                                 if val_in_sol < 0.05:
                                     should_sell = True
                                     reason = f"大佬余额价值仅 {val_in_sol:.4f} SOL (判定为粉尘)"
@@ -206,7 +204,7 @@ class PortfolioManager:
 
                     except Exception as e:
                         logger.error(f"同步检查异常: {e}")
-
+                
                 await asyncio.sleep(20)
 
     async def monitor_1000x_profit(self):
@@ -280,12 +278,12 @@ class PortfolioManager:
             await asyncio.sleep(60)
 
     async def send_daily_summary(self):
-        """ 生成并发送日报 (含当日盈亏统计) """
+        """ 生成并发送日报 (含当日盈亏 & 累计历史盈亏 & 智能胜率) """
         logger.info("📊 正在生成每日日报...")
-
+        
         async with aiohttp.ClientSession(trust_env=True) as session:
             try:
-                # 1. 基础数据获取 (SOL价格 & 余额)
+                # 1. 基础数据获取
                 usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
                 quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
                 sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
@@ -293,7 +291,7 @@ class PortfolioManager:
                 balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
                 sol_balance = balance_resp.value / 10 ** 9
 
-                # 2. 计算当前持仓价值
+                # 2. 持仓价值
                 holdings_val_sol = 0
                 holdings_details = ""
                 if self.portfolio:
@@ -308,66 +306,83 @@ class PortfolioManager:
                 total_asset_sol = sol_balance + holdings_val_sol
                 total_asset_usd = total_asset_sol * sol_price
 
-                # --- 🔥🔥 核心新增：当日盈亏回放计算 (PnL Replay) 🔥🔥 ---
-                # 定义“今天” (过去24小时)
+                # --- 3. 核心计算：盈亏回放 & 智能胜率 ---
                 yesterday = datetime.now() - timedelta(days=1)
-
-                # 临时变量用于回放计算
-                temp_holdings = {}  # {token: amount}
-                temp_costs = {}  # {token: total_cost_sol}
-
+                
+                temp_holdings = {}
+                temp_costs = {}
+                
                 daily_profit_sol = 0.0
+                total_realized_profit_sol = 0.0
+                
+                # 胜率计数器
                 daily_wins = 0
                 daily_losses = 0
-                daily_trade_count = 0
+                total_wins = 0
+                total_losses = 0
 
-                # 遍历所有历史，重建成本并统计今日表现
+                # 🔥 灰尘单过滤阈值 (成本低于 0.01 SOL 的卖出不计入胜率)
+                # 逻辑：如果是 RugPull，成本肯定 > 0.01，会算作亏损（Valid）。
+                #       如果是扫尾货，成本极低，会被忽略。
+                COST_THRESHOLD_FOR_WINRATE = 0.01 
+
                 for record in self.trade_history:
                     token = record['token']
                     action = record['action']
                     amount = record['amount']
                     val = record['value_sol']
-
+                    
                     try:
                         rec_time = datetime.strptime(record['time'], "%Y-%m-%d %H:%M:%S")
                     except:
-                        continue  # 跳过时间格式错误的旧数据
+                        continue 
 
                     if action == 'BUY':
-                        # 累加持仓和成本
                         temp_holdings[token] = temp_holdings.get(token, 0) + amount
                         temp_costs[token] = temp_costs.get(token, 0.0) + val
-
+                        
                     elif 'SELL' in action:
-                        # 计算本次卖出的成本 (平均成本法)
                         current_holding = temp_holdings.get(token, 0)
                         total_cost = temp_costs.get(token, 0.0)
-
+                        
                         if current_holding > 0:
                             avg_price = total_cost / current_holding
                             cost_of_this_sell = avg_price * amount
-
-                            # 计算单笔盈亏
+                            
+                            # 1. 算钱 (所有卖出都算钱，一分钱也是钱)
                             pnl = val - cost_of_this_sell
+                            total_realized_profit_sol += pnl
+                            
+                            is_today = rec_time >= yesterday
+                            if is_today:
+                                daily_profit_sol += pnl
 
-                            # 更新剩余持仓和成本
+                            # 2. 算胜率 (智能过滤灰尘)
+                            # 只有当这笔卖出的“成本投入”大于阈值时，才认为是一次有效博弈
+                            if cost_of_this_sell > COST_THRESHOLD_FOR_WINRATE:
+                                if pnl > 0:
+                                    total_wins += 1
+                                    if is_today: daily_wins += 1
+                                else:
+                                    total_losses += 1
+                                    if is_today: daily_losses += 1
+                            
+                            # 更新剩余
                             temp_holdings[token] = max(0, current_holding - amount)
                             temp_costs[token] = max(0.0, total_cost - cost_of_this_sell)
 
-                            # 统计：如果这笔卖出发生在今天
-                            if rec_time >= yesterday:
-                                daily_profit_sol += pnl
-                                daily_trade_count += 1
-                                if pnl > 0:
-                                    daily_wins += 1
-                                else:
-                                    daily_losses += 1
-
-                # 计算胜率
-                daily_win_rate = (daily_wins / daily_trade_count * 100) if daily_trade_count > 0 else 0.0
+                # 计算百分比
+                daily_total_valid_trades = daily_wins + daily_losses
+                daily_win_rate = (daily_wins / daily_total_valid_trades * 100) if daily_total_valid_trades > 0 else 0.0
+                
+                total_valid_trades = total_wins + total_losses
+                total_win_rate = (total_wins / total_valid_trades * 100) if total_valid_trades > 0 else 0.0
+                
+                # USD 估值
                 daily_profit_usd = daily_profit_sol * sol_price
+                total_profit_usd = total_realized_profit_sol * sol_price
 
-                # 4. 生成报告文本
+                # 4. 生成报告
                 report = f"""
 【📅 每日交易与资产报告】
 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -379,16 +394,16 @@ class PortfolioManager:
 • 持仓价值: {holdings_val_sol:.4f} SOL
 • 总计资产: {total_asset_sol:.4f} SOL (≈ ${total_asset_usd:.2f})
 
-📈 今日战绩 (近24h):
+📈 战绩统计:
 -------------------
-• 已结盈亏: {'+' if daily_profit_sol >= 0 else ''}{daily_profit_sol:.4f} SOL (≈ ${daily_profit_usd:.2f})
-• 今日胜率: {daily_win_rate:.1f}% ({daily_wins} 胜 / {daily_losses} 负)
-• 交易笔数: {daily_trade_count} 笔
+• 今日已结盈亏: {'+' if daily_profit_sol >= 0 else ''}{daily_profit_sol:.4f} SOL
+• 今日有效胜率: {daily_win_rate:.1f}% ({daily_wins} 胜 / {daily_losses} 负)
 
-📊 历史累计统计:
+🏆 历史累计数据:
 -------------------
-• 总买入次数: {sum(1 for x in self.trade_history if x['action'] == 'BUY')}
-• 总卖出次数: {sum(1 for x in self.trade_history if 'SELL' in x['action'])}
+• 累计已结盈亏: {'+' if total_realized_profit_sol >= 0 else ''}{total_realized_profit_sol:.4f} SOL (≈ ${total_profit_usd:.2f})
+• 累计有效胜率: {total_win_rate:.1f}% ({total_wins} 胜 / {total_losses} 负)
+• 累计交易笔数: {sum(1 for x in self.trade_history if 'SELL' in x['action'])} (含灰尘)
 
 👜 当前持仓明细:
 {holdings_details if holdings_details else "(空仓)"}
@@ -396,7 +411,7 @@ class PortfolioManager:
 🤖 机器人状态: 正常运行中
 """
                 await send_email_async("📊 [日报] 资产与盈亏统计", report, attachment_path=PORTFOLIO_FILE)
-                logger.info("✅ 日报已发送 (包含详细盈亏数据)")
+                logger.info("✅ 日报已发送 (含智能胜率统计)")
 
             except Exception as e:
                 logger.error(f"生成日报失败: {e}")
