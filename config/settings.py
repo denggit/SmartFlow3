@@ -18,14 +18,14 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=ENV_PATH) 
 
 # --- API Keys ---
-API_KEY = os.getenv("API_KEY")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 TARGET_WALLET = os.getenv("TARGET_WALLET")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 
 # --- 基础配置 ---
-WSS_ENDPOINT = f"wss://mainnet.helius-rpc.com/?api-key={API_KEY}"
-HTTP_ENDPOINT = f"https://api.helius.xyz/v0/transactions/?api-key={API_KEY}"
-RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={API_KEY}"
+WSS_ENDPOINT = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+HTTP_ENDPOINT = f"https://api.helius.xyz/v0/transactions/?api-key={HELIUS_API_KEY}"
+RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 BOT_NAME = os.getenv("BOT_NAME", "NONAME")
 
 # --- 策略配置 (支持动态调整) ---

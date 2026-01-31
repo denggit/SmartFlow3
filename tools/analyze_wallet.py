@@ -14,7 +14,7 @@ import aiohttp
 
 # 导入配置中的 API Key
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.settings import API_KEY
+from config.settings import HELIUS_API_KEY
 
 # === ⚙️ 基础配置 ===
 TARGET_TX_COUNT = 20000 
@@ -33,7 +33,7 @@ async def fetch_history_pagination(session, address, max_count=1000):
     while len(all_txs) < max_count:
         batch_limit = 100
         url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
-        params = {"api-key": API_KEY, "type": "SWAP", "limit": str(batch_limit)}
+        params = {"api-key": HELIUS_API_KEY, "type": "SWAP", "limit": str(batch_limit)}
         if last_signature: params["before"] = last_signature
 
         try:

@@ -19,7 +19,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config.settings import (
-    API_KEY, TARGET_WALLET, PRIVATE_KEY, RPC_URL,
+    HELIUS_API_KEY, TARGET_WALLET, PRIVATE_KEY, RPC_URL,
     EMAIL_SENDER
 )
 from services.solana.trader import SolanaTrader
