@@ -135,8 +135,14 @@ class PortfolioManager:
             if self.portfolio[token_mint]['my_balance'] < 100:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
+                
+                # ✨ 新增：触发关闭账户操作
+                logger.info(f"🧹 正在尝试回收账户租金...")
+                # 稍微等一下链上确认，防止因为余额没更新导致关闭失败
+                await asyncio.sleep(2) 
+                asyncio.create_task(self.trader.close_token_account(token_mint))
 
-            self._save_portfolio()  # 保存
+            self._save_portfolio()
             self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
 
             # 邮件通知
@@ -211,6 +217,11 @@ class PortfolioManager:
             # 清理状态
             if token_mint in self.portfolio:
                 del self.portfolio[token_mint]
+
+            # ✨ 新增：触发关闭账户操作
+            logger.info(f"🧹 [强平] 正在尝试回收账户租金...")
+            await asyncio.sleep(2)
+            asyncio.create_task(self.trader.close_token_account(token_mint))
 
             # 🔥 立即保存
             self._save_portfolio()
