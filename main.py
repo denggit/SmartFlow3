@@ -26,24 +26,29 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
     token = trade['token_address']
 
     if trade['action'] == "BUY":
-        # 1. 风控
+        # --- 1. 基础风控 ---
         is_safe, liq, fdv = await check_token_liquidity(session, token)
+        
+        # ✅ 修复 Bug：这里变量名必须用 token，不能用 mint
+        is_honeypot = await check_is_honeypot(session, token) 
+
         if not is_safe:
-            logger.warning(f"⚠️ 无法获取数据: {token}")
+            logger.warning(f"⚠️ 无法获取数据或流动性过低: {token}")
             return
 
-        is_honeypot = await check_is_honeypot(session, token)
         if not is_honeypot:
-            # 为FALSE的话说明不安全
-            logger.warning(f"⚠️ 该代币不安全: {token}")
+            logger.warning(f"🚫 拦截貔貅盘: {token}")
             return
 
-        logger.info(f"🔍 体检: 池子 ${liq:,.0f} | 市值 ${fdv:,.0f}")
-        if liq < MIN_LIQUIDITY_USD or fdv < MIN_FDV or fdv > MAX_FDV:
+        # --- 🔥 新增：买入次数限制 ---
+        buy_times = pm.get_buy_counts(token)
+        if buy_times >= 3:
+            logger.warning(f"🛑 [风控] {token} 已买入 {buy_times} 次，停止加仓")
             return
-
-        # 2. 执行买入
-        logger.info(f"🎯 正在跟单买入: {token}")
+        
+        # --- 2. 通过检查，执行买入 ---
+        logger.info(f"🔍 体检通过: 池子 ${liq:,.0f} | 市值 ${fdv:,.0f} | 第 {buy_times + 1} 次买入")
+        
         amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
         success, est_out = await pm.trader.execute_swap(
             pm.trader.SOL_MINT, token, amount_in, SLIPPAGE_BUY
