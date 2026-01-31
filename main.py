@@ -21,6 +21,12 @@ from utils.logger import logger
 
 async def process_tx_task(session, signature, pm: PortfolioManager):
     tx_detail = await fetch_transaction_details(session, signature)
+
+    # 如果 fetch 失败（重试3次后还是空），这里 tx_detail 就是 None
+    if not tx_detail:
+        logger.warning(f"⚠️ 无法获取交易详情: {signature} (Helius 尚未索引或失败)")
+        return
+
     trade = parse_tx(tx_detail)
     if not trade or not trade['token_address']:
         return

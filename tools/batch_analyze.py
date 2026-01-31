@@ -95,9 +95,9 @@ async def analyze_one_wallet(session, address, pbar):
             "战力评级": tier,
             "置信度": confidence,  # 🔥 新增指标
             "最佳定位": best_role,  # 🔥 新增指标
-            "盈亏比": desc.split("|")[0].split(":")[-1].strip(),
+            "盈亏比": float(desc.split("|")[0].split(":")[-1].strip()),
             "总盈亏(SOL)": round(total_profit, 2),
-            "胜率": f"{win_rate:.1%}",
+            "胜率": win_rate,
             "最大单笔ROI": f"{max_roi:.0%}",
             "中位持仓(分)": round(median_hold, 1),
             "代币数": len(results),
