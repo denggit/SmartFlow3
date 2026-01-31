@@ -38,6 +38,9 @@ class PortfolioManager:
         self._load_data()
         self._rebuild_buy_counts_cache()
 
+        # 🔥 新增一把锁
+        self.lock = asyncio.Lock()  
+
     def _ensure_data_dir(self):
         if not os.path.exists(DATA_DIR):
             os.makedirs(DATA_DIR)
