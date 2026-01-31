@@ -26,28 +26,36 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
     token = trade['token_address']
 
     if trade['action'] == "BUY":
-        # --- 1. 基础风控 ---
+        # 1. 基础风控 (貔貅检测等)
         is_safe, liq, fdv = await check_token_liquidity(session, token)
+        is_honeypot = await check_is_honeypot(session, token)
         
-        # ✅ 修复 Bug：这里变量名必须用 token，不能用 mint
-        is_honeypot = await check_is_honeypot(session, token) 
-
-        if not is_safe:
-            logger.warning(f"⚠️ 无法获取数据或流动性过低: {token}")
-            return
-
+        if not is_safe: return
         if not is_honeypot:
             logger.warning(f"🚫 拦截貔貅盘: {token}")
             return
 
-        # --- 🔥 新增：买入次数限制 ---
+        # 2. 次数限制
         buy_times = pm.get_buy_counts(token)
         if buy_times >= 3:
             logger.warning(f"🛑 [风控] {token} 已买入 {buy_times} 次，停止加仓")
             return
+
+        # --- 🔥🔥🔥 新增：资金安全检查 (Wallet Balance Check) 🔥🔥🔥 ---
+        # 获取机器人钱包当前的 SOL 余额
+        my_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.SOL_MINT)
         
-        # --- 2. 通过检查，执行买入 ---
-        logger.info(f"🔍 体检通过: 池子 ${liq:,.0f} | 市值 ${fdv:,.0f} | 第 {buy_times + 1} 次买入")
+        # 设定安全线：只有当余额 > 跟单金额的 2 倍时才动手
+        # 例如：跟单 0.1，钱包至少要有 0.2 才买
+        safe_margin = COPY_AMOUNT_SOL * 2
+        
+        if my_balance < safe_margin:
+            logger.warning(f"💸 [资金保护] 余额不足！当前: {my_balance:.4f} SOL < 安全线: {safe_margin:.4f} SOL。停止买入以保留Gas费。")
+            return
+        # -------------------------------------------------------------
+
+        # 3. 执行买入
+        logger.info(f"🔍 体检通过: 池子 ${liq:,.0f} | 余额充足 {my_balance:.2f} SOL | 第 {buy_times + 1} 次买入")
         
         amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
         success, est_out = await pm.trader.execute_swap(
