@@ -67,18 +67,33 @@ class PortfolioManager:
                     self.buy_counts_cache[token] = self.buy_counts_cache.get(token, 0) + 1
 
     def _save_portfolio(self):
-        try:
-            with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.portfolio, f, indent=4)
-        except Exception as e:
-            logger.error(f"❌ 保存持仓失败: {e}")
+        """ 异步保存持仓 (扔到线程池) """
+        # 使用 lambda 或 functools.partial 将参数传给 worker
+        asyncio.get_event_loop().run_in_executor(
+            self.calc_executor, self._write_json_worker, PORTFOLIO_FILE, self.portfolio
+        )
 
     def _save_history(self):
+        """ 异步保存历史 (扔到线程池) """
+        # 注意：这里需要深拷贝或快照，防止写入时 list 发生变化，但为了性能，
+        # 我们假设 append 操作是原子的。更严谨的做法是传 copy。
+        history_snapshot = list(self.trade_history) 
+        asyncio.get_event_loop().run_in_executor(
+            self.calc_executor, self._write_json_worker, HISTORY_FILE, history_snapshot
+        )
+
+    @staticmethod
+    def _write_json_worker(filepath, data):
+        """ 专门负责写文件的工人 (后台线程) """
         try:
-            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.trade_history, f, indent=4)
+            # 写入临时文件再重命名，防止写入一半断电导致文件损坏
+            temp_file = filepath + ".tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+            # 原子替换 (Atomic Replace)
+            os.replace(temp_file, filepath)
         except Exception as e:
-            logger.error(f"❌ 保存历史失败: {e}")
+            logger.error(f"❌ 后台写入文件失败 {filepath}: {e}")
 
     def _record_history(self, action, token, amount, value_sol):
         record = {
