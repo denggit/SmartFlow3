@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
 # 导入配置和工具
-from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI
+from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI, REPORT_HOUR, REPORT_MINUTE
 from services.notification import send_email_async
 from utils.logger import logger
 
@@ -326,16 +326,27 @@ class PortfolioManager:
             asyncio.create_task(send_email_async(subject, msg))
 
     async def schedule_daily_report(self):
-        logger.info("📅 日报调度器已启动 (每天 09:00 发送)...")
+        """ 每日日报调度器 (支持自定义时间) """
+        # 🔥 2. 日志里打印出设定好的时间，方便检查
+        logger.info(f"📅 日报调度器已启动 (每天 {REPORT_HOUR:02d}:{REPORT_MINUTE:02d} 发送)...")
+        
         while self.is_running:
             now = datetime.now()
-            target_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            
+            # 🔥 3. 使用配置的时间变量
+            target_time = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+
+            # 如果今天的时间已经过了，就定在明天的这个时间
             if now >= target_time:
                 target_time += timedelta(days=1)
+
             sleep_seconds = (target_time - now).total_seconds()
             logger.info(f"⏳ 距离发送日报还有 {sleep_seconds / 3600:.1f} 小时")
+
             await asyncio.sleep(sleep_seconds)
             await self.send_daily_summary()
+            
+            # 发送完休息 60 秒，防止一分钟内重复触发
             await asyncio.sleep(60)
 
     @staticmethod
