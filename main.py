@@ -4,11 +4,12 @@
 @Author     : Zijun Deng
 @Date       : 1/30/26 1:20 PM
 @File       : main.py
-@Description: 智能跟单机器人 (支持 --proxy 参数)
+@Description: 智能跟单机器人 (修复版：补全买入参数 + 完善日志)
 """
 import argparse
 import asyncio
 import os
+import traceback  # 🔥 引入错误堆栈打印
 
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
     MIN_FDV, MAX_BUY_TIME
@@ -20,110 +21,102 @@ from utils.logger import logger
 
 
 async def process_tx_task(session, signature, pm: PortfolioManager):
-    tx_detail = await fetch_transaction_details(session, signature)
+    try:
+        tx_detail = await fetch_transaction_details(session, signature)
+        # 如果获取失败，直接返回
+        if not tx_detail: return
 
-    # 如果 fetch 失败（重试3次后还是空），这里 tx_detail 就是 None
-    if not tx_detail:
-        logger.warning(f"⚠️ 无法获取交易详情: {signature} (Helius 尚未索引或失败)")
-        return
-
-    trade = parse_tx(tx_detail)
-    if not trade or not trade['token_address']:
-        return
-
-    token = trade['token_address']
-
-    if trade['action'] == "BUY":
-        # --- 🔥🔥🔥 新增：大哥买入金额过滤 (试盘过滤) 🔥🔥🔥 ---
-        # 获取这笔交易大哥花费的 SOL
-        smart_money_cost = trade.get('sol_spent', 0)
-        
-        if smart_money_cost < MIN_SMART_MONEY_COST:
-            logger.warning(f"📉 [过滤] 大哥买入金额过小: {smart_money_cost:.4f} SOL < {MIN_SMART_MONEY_COST} SOL，判断为试盘，忽略跟单")
+        trade = parse_tx(tx_detail)
+        if not trade or not trade['token_address']:
             return
 
-        # 1. 基础风控 (貔貅检测等)
-        is_safe, liq, fdv = await check_token_liquidity(session, token)
+        token = trade['token_address']
 
-        if not is_safe:
-            logger.warning(f"🚫 拦截低流动性代币: {token}")
-            return
+        if trade['action'] == "BUY":
+            # --- 1. 大哥试盘过滤 ---
+            smart_money_cost = trade.get('sol_spent', 0)
+            if smart_money_cost < MIN_SMART_MONEY_COST:
+                # 调试日志，平时可关
+                # logger.warning(f"📉 [过滤] {token} 买入金额过小: {smart_money_cost:.4f} SOL")
+                return
 
-        # 如果池子太小 (比如 < $3000)，太容易被操控，不跟
-        if liq < MIN_LIQUIDITY_USD:
-            logger.warning(f"💧 [风控拦截] 流动性过低: ${liq:,.0f} < ${MIN_LIQUIDITY_USD:,.0f}")
-            return
-    
-        # 如果市值太小
-        if fdv < MIN_FDV:
-             logger.warning(f"📉 [风控拦截] 市值过小: ${fdv:,.0f} < ${MIN_FDV:,.0f}")
-             return
-    
-        # 如果市值太大 (比如 > 500万)，说明涨不动了，不跟
-        if fdv > MAX_FDV:
-             logger.warning(f"📈 [风控拦截] 市值过大(空间小): ${fdv:,.0f} > ${MAX_FDV:,.0f}")
-             return
+            # --- 2. 基础风控 ---
+            is_safe, liq, fdv = await check_token_liquidity(session, token)
 
-        is_honeypot = await check_is_honeypot(session, token)
-        if not is_honeypot:
-            logger.warning(f"🚫 拦截貔貅盘: {token}")
-            return
+            if not is_safe:
+                logger.warning(f"🚫 [拦截] 低流动性: {token}")
+                return
 
-        # 2. 次数限制
-        buy_times = pm.get_buy_counts(token)
-        if buy_times >= MAX_BUY_TIME:
-            logger.warning(f"🛑 [风控] {token} 已买入 {buy_times} 次，停止加仓")
-            return
+            if liq < MIN_LIQUIDITY_USD:
+                logger.warning(f"💧 [拦截] 池子太小: {token} (${liq:,.0f} < ${MIN_LIQUIDITY_USD:,.0f})")
+                return
 
-        # --- 🔥🔥🔥 新增：资金安全检查 (Wallet Balance Check) 🔥🔥🔥 ---
-        # 获取机器人钱包当前的 SOL 余额
-        my_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.SOL_MINT)
+            if fdv < MIN_FDV:
+                logger.warning(f"📉 [拦截] 市值太小: {token} (${fdv:,.0f} < ${MIN_FDV:,.0f})")
+                return
 
-        # 设定安全线：只有当余额 > 跟单金额的 2 倍时才动手
-        # 例如：跟单 0.1，钱包至少要有 0.2 才买
-        safe_margin = COPY_AMOUNT_SOL * 2
+            if fdv > MAX_FDV:
+                logger.warning(f"📈 [拦截] 市值过大: {token} (${fdv:,.0f} > ${MAX_FDV:,.0f})")
+                return
 
-        if my_balance < safe_margin:
-            logger.warning(
-                f"💸 [资金保护] 余额不足！当前: {my_balance:.4f} SOL < 安全线: {safe_margin:.4f} SOL。停止买入以保留Gas费。")
-            return
-        # -------------------------------------------------------------
+            is_honeypot = await check_is_honeypot(session, token)
+            if not is_honeypot:
+                logger.warning(f"🚫 [拦截] 貔貅盘: {token}")
+                return
 
-        # 3. 执行买入
-        logger.info(f"🔍 体检通过: 池子 ${liq:,.0f} | 余额充足 {my_balance:.2f} SOL | 第 {buy_times + 1} 次买入")
-
-        # 🔥🔥🔥 核心修改：加锁检查 🔥🔥🔥
-        # 🔥🔥🔥 优化后：只锁当前 Token 🔥🔥🔥
-        # 这样 Token A 的买入不会阻塞 Token B 的买入
-        async with pm.get_token_lock(token):
-            
-            # 双重检查 (Double Check)
+            # --- 3. 次数与资金限制 ---
             buy_times = pm.get_buy_counts(token)
             if buy_times >= MAX_BUY_TIME:
-                logger.warning(f"🛑 [并发阻断] {token} 次数已满")
+                logger.warning(f"🛑 [风控] {token} 已买入 {buy_times} 次，停止加仓")
                 return
-            
-            # 执行买入
-            amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
-            success, est_out = await pm.trader.execute_swap(...)
-            if success:
-                pm.add_position(token, est_out, amount_in)
 
-    elif trade['action'] == "SELL":
-        # 卖出逻辑完全不用锁，飞快执行
-        await pm.execute_proportional_sell(token, trade['amount'])
+            my_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.SOL_MINT)
+            safe_margin = COPY_AMOUNT_SOL * 2  # 预留2倍Gas费
+
+            if my_balance < safe_margin:
+                logger.warning(f"💸 [余额不足] 当前: {my_balance:.4f} SOL，暂停买入")
+                return
+
+            # --- 4. 执行买入 ---
+            # 🔥 修复日志：打印代币地址！
+            logger.info(f"🔍 体检通过 [{token}]: 池子 ${liq:,.0f} | 余额 {my_balance:.2f} SOL | 第 {buy_times + 1} 次")
+
+            async with pm.get_token_lock(token):
+                # 双重检查
+                if pm.get_buy_counts(token) >= MAX_BUY_TIME:
+                    return
+
+                amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)
+
+                # 🔥🔥 核心修复：填入真正的参数，而不是 ... 🔥🔥
+                success, est_out = await pm.trader.execute_swap(
+                    input_mint=pm.trader.SOL_MINT,  # 用 SOL 买
+                    output_mint=token,  # 买这个 Token
+                    amount_lamports=amount_in,  # 买多少
+                    slippage_bps=SLIPPAGE_BUY  # 滑点
+                )
+
+                if success:
+                    pm.add_position(token, est_out, amount_in)
+                    logger.info(f"✅ 跟单成功: {token} | 仓位已记录")
+                else:
+                    logger.error(f"❌ 跟单失败: {token} (Swap执行返回False)")
+
+        elif trade['action'] == "SELL":
+            await pm.execute_proportional_sell(token, trade['amount'])
+
+    except Exception as e:
+        # 🔥 全局异常捕获：如果哪里再报错，这里会打印出来！
+        logger.error(f"💥 处理交易发生崩溃: {e}")
+        logger.error(traceback.format_exc())
 
 
 async def main():
-    # 1. 初始化服务
     trader = SolanaTrader(RPC_URL)
-
-    # 2. 初始化核心逻辑
     pm = PortfolioManager(trader)
 
     logger.info("🤖 机器人全系统启动...")
 
-    # 3. 运行所有任务
     await asyncio.gather(
         pm.monitor_1000x_profit(),
         pm.monitor_sync_positions(),
@@ -133,19 +126,16 @@ async def main():
 
 
 if __name__ == "__main__":
-    # 🔥 新增：参数解析逻辑
     parser = argparse.ArgumentParser(description='Solana Copy Trading Bot')
-    parser.add_argument('--proxy', action='store_true', help='开启本地 Clash 代理 (http://127.0.0.1:7890)')
+    parser.add_argument('--proxy', action='store_true', help='开启本地 Clash 代理')
     args = parser.parse_args()
 
     if args.proxy:
-        # 如果带了 --proxy，强制设置环境变量
         proxy_url = "http://127.0.0.1:7890"
         os.environ["HTTP_PROXY"] = proxy_url
         os.environ["HTTPS_PROXY"] = proxy_url
         logger.info(f"🌍 本地模式: 已启用代理 {proxy_url}")
     else:
-        # 如果没带，不设置任何代理，适合云端直连
         logger.info("☁️ 云端模式: 直连无代理")
 
     try:
