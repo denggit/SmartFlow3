@@ -87,7 +87,7 @@ class SolanaTrader:
             # 返回原始整数 (例如 1000000 而不是 1.0)
             return int(balance_resp.value.amount)
         except Exception:
-            return 0
+            return None
 
     def _get_proxy(self):
         return os.environ.get("HTTP_PROXY")

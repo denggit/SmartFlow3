@@ -290,6 +290,12 @@ class PortfolioManager:
                         if my_data['my_balance'] <= 0: continue
 
                         sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
+
+                        # 🔥 新增保护：如果获取失败(None)，认为是网络问题，直接跳过本次检查
+                        if sm_amount_raw is None:
+                            logger.warning(f"⚠️ [同步跳过] 无法获取大佬 {token_mint} 余额 (网络波动)")
+                            continue
+
                         should_sell = False
                         reason = ""
 
