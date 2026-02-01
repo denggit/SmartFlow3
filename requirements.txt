@@ -15,3 +15,5 @@ websockets>=12.0
 solana>=0.30.0
 solders>=0.18.0
 
+# 进程监控（可选，用于monitor_bots.py）
+psutil>=5.9.0
