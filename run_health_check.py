@@ -275,23 +275,51 @@ async def test_websocket_connection():
             logger.error(traceback.format_exc())
             return False
         
-        # 4. 测试Helius API（获取交易详情）
-        logger.info("📡 测试 Helius API（获取交易详情）...")
+        # 4. 测试Helius API（获取目标钱包的最近交易）
+        logger.info("📡 测试 Helius API（获取目标钱包最近交易）...")
         try:
-            # 使用一个已知的交易签名进行测试
-            test_signature = "5VERv8NMvzbJMEkV8xnrLkEaWRt6kw5okkM7XB4YpZyf"  # Solana主网的一个公共交易
-            
             connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False, force_close=True)
             async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
-                tx_detail = await fetch_transaction_details(session, test_signature)
-                if tx_detail:
-                    logger.info("✅ Helius API 测试通过（成功获取交易详情）")
-                    return True
-                else:
-                    logger.warning("⚠️ Helius API 返回空数据（可能是交易未索引，但API可用）")
-                    return True  # API可用，只是这个交易可能未索引
+                # 使用地址API获取目标钱包的最近交易（更可靠的方法）
+                url = f"https://api.helius.xyz/v0/addresses/{TARGET_WALLET}/transactions"
+                params = {
+                    "api-key": HELIUS_API_KEY,
+                    "type": "SWAP",
+                    "limit": 1  # 只获取最近1条交易
+                }
+                
+                async with session.get(url, params=params, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data and len(data) > 0:
+                            # 获取到交易后，测试获取交易详情
+                            test_signature = data[0].get('signature')
+                            if test_signature:
+                                logger.info(f"✅ 获取到目标钱包最近交易: {test_signature[:16]}...")
+                                # 测试获取交易详情
+                                tx_detail = await fetch_transaction_details(session, test_signature)
+                                if tx_detail:
+                                    logger.info("✅ Helius API 测试通过（成功获取交易详情）")
+                                    return True
+                                else:
+                                    logger.warning("⚠️ 无法获取交易详情（可能交易未完全索引，但API可用）")
+                                    return True  # API可用，只是这个交易可能未完全索引
+                            else:
+                                logger.warning("⚠️ 交易数据格式异常，但API可用")
+                                return True
+                        else:
+                            logger.warning("⚠️ 目标钱包暂无SWAP交易，但API可用")
+                            return True  # API可用，只是没有交易
+                    elif response.status == 429:
+                        logger.warning("⚠️ Helius API 限流中（但服务可用）")
+                        return True  # 限流说明服务可用
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"❌ Helius API 请求失败: HTTP {response.status}")
+                        logger.error(f"   错误信息: {error_text[:200]}")
+                        return False
         except Exception as e:
-            logger.error(f"❌ Helius API 测试失败: {e}")
+            logger.error(f"❌ Helius API 测试异常: {e}")
             logger.error(traceback.format_exc())
             return False
         
