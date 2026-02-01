@@ -113,7 +113,16 @@ async def start_monitor(process_callback, pm):
         while True:
             try:
                 logger.info(f"🔗 连接 WebSocket: {TARGET_WALLET[:6]}...")
-                async with websockets.connect(WSS_ENDPOINT, ping_interval=30, ping_timeout=60) as ws:
+                # 🔥 关键修复：增加连接参数，提高连接稳定性
+                # close_timeout=None: 不主动关闭连接
+                # max_size=None: 不限制消息大小
+                async with websockets.connect(
+                    WSS_ENDPOINT, 
+                    ping_interval=20,  # 每20秒发送ping（更频繁）
+                    ping_timeout=10,   # 10秒内没收到pong就认为断开（更快检测）
+                    close_timeout=None,  # 不主动关闭连接
+                    max_size=None       # 不限制消息大小
+                ) as ws:
                     # 发送订阅请求
                     subscribe_msg = {
                         "jsonrpc": "2.0", 
@@ -269,7 +278,10 @@ async def start_monitor(process_callback, pm):
                             pass
 
             except websockets.exceptions.ConnectionClosed as e:
-                logger.error(f"❌ WebSocket 连接关闭: {e}, 3秒后重连...")
+                # 🔥 详细记录连接关闭信息，便于诊断
+                close_code = e.code if hasattr(e, 'code') else 'unknown'
+                close_reason = e.reason if hasattr(e, 'reason') else 'unknown'
+                logger.error(f"❌ WebSocket 连接关闭: code={close_code}, reason={close_reason}, 3秒后重连...")
                 await asyncio.sleep(3)
             except Exception as e:
                 logger.error(f"❌ WebSocket 异常: {e}, 3秒后重连...")
