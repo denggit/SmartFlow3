@@ -12,7 +12,7 @@ import os
 import traceback  # 🔥 引入错误堆栈打印
 
 from config.settings import RPC_URL, COPY_AMOUNT_SOL, SLIPPAGE_BUY, MIN_SMART_MONEY_COST, MIN_LIQUIDITY_USD, MAX_FDV, \
-    MIN_FDV, MAX_BUY_TIME
+    MIN_FDV, MAX_POSITION_SOL, MAX_BUY_COUNTS_HARD_LIMIT
 from core.portfolio import PortfolioManager
 from services.notification import send_email_async
 from services.risk_control import check_token_liquidity, check_is_safe_token
@@ -66,12 +66,26 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                 logger.warning(f"🚫 [拦截] 貔貅盘/高风险代币: {token}")
                 return
 
-            # --- 3. 次数与资金限制 ---
-            buy_times = pm.get_buy_counts(token)
-            if buy_times >= MAX_BUY_TIME:
-                logger.warning(f"🛑 [风控] {token} 已买入 {buy_times} 次，停止加仓")
+            # --- 3. 资金敞口限制 (双重熔断逻辑) ---
+            
+            # 获取当前已投入成本
+            current_cost = pm.get_position_cost(token)
+            
+            # 【熔断 1】金额风控：防止归零风险
+            # 逻辑：(已花掉的钱 + 这次要花的钱) 是否超过 MAX_POSITION_SOL？
+            if current_cost + COPY_AMOUNT_SOL > MAX_POSITION_SOL:
+                # 只有当你想看日志时才打开，避免刷屏
+                # logger.warning(f"🛑 [金额熔断] {token} 总投入将超限 ({current_cost:.2f} + {COPY_AMOUNT_SOL} > {MAX_POSITION_SOL})")
                 return
 
+            # 【熔断 2】频次风控：防止高频刷单/技术滥用
+            # 逻辑：是否买入次数过于夸张（超过 MAX_BUY_COUNTS_HARD_LIMIT）？
+            buy_times = pm.get_buy_counts(token)
+            if buy_times >= MAX_BUY_COUNTS_HARD_LIMIT:
+                logger.warning(f"🛑 [频次熔断] {token} 买入次数异常 ({buy_times})，强制停止")
+                return
+
+            # --- 4. 钱包余额检查 ---
             my_balance = await pm.trader.get_token_balance(str(pm.trader.payer.pubkey()), pm.trader.SOL_MINT)
             safe_margin = COPY_AMOUNT_SOL * 2  # 预留2倍Gas费
 
@@ -79,13 +93,18 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                 logger.warning(f"💸 [余额不足] 当前: {my_balance:.4f} SOL，暂停买入")
                 return
 
-            # --- 4. 执行买入 ---
-            # 🔥 修复日志：打印代币地址！
-            logger.info(f"🔍 体检通过 [{token}]: 池子 ${liq:,.0f} | 余额 {my_balance:.2f} SOL | 第 {buy_times + 1} 次")
+            # --- 5. 执行买入 ---
+            # 🔥 修复日志：打印代币地址和成本信息！
+            logger.info(f"🔍 体检通过 [{token}]: 池子 ${liq:,.0f} | 余额 {my_balance:.2f} SOL | 当前成本 {current_cost:.2f} SOL | 第 {buy_times + 1} 次")
 
             async with pm.get_token_lock(token):
-                # 双重检查
-                if pm.get_buy_counts(token) >= MAX_BUY_TIME:
+                # 双重检查（防止并发）
+                current_cost_check = pm.get_position_cost(token)
+                if current_cost_check + COPY_AMOUNT_SOL > MAX_POSITION_SOL:
+                    return
+                
+                buy_times_check = pm.get_buy_counts(token)
+                if buy_times_check >= MAX_BUY_COUNTS_HARD_LIMIT:
                     return
 
                 amount_in = int(COPY_AMOUNT_SOL * 10 ** 9)

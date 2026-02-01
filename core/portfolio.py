@@ -147,10 +147,30 @@ class PortfolioManager:
             f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']} | 第 {self.buy_counts_cache[token_mint]} 次买入")
 
     def get_buy_counts(self, token_mint):
+        """
+        获取指定代币的累计买入次数
+        注意：买入次数不会在清仓后清零，是累计的
+        :param token_mint: 代币地址
+        :return: 累计买入次数
+        """
         return self.buy_counts_cache.get(token_mint, 0)
 
     def get_sell_counts(self, token_mint):
         return self.sell_counts_cache.get(token_mint, 0)
+
+    def get_position_cost(self, token_mint):
+        """
+        获取当前代币的总投入成本 (SOL)
+        注意：
+        1. 这里返回的是【成本】，不是【当前价值】。跌了成本不变，所以不会触发"越跌越补"的死循环。
+        2. 按比例卖出时，成本不会减少，只有完全清仓后，成本才会归零。
+        3. 这样设计是为了避免因为收益达到设定限制而无限减仓。
+        :param token_mint: 代币地址
+        :return: 当前持仓的总投入成本（SOL）
+        """
+        if token_mint in self.portfolio:
+            return self.portfolio[token_mint].get('cost_sol', 0.0)
+        return 0.0
 
     def _generate_trade_history_table(self, token_mint):
         """
@@ -334,14 +354,31 @@ class PortfolioManager:
         )
 
         if success:
-            self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+            # 🛡️ V4 Pro: 按比例卖出时只减少余额，不减少成本
+            # 原因：避免因为收益达到设定限制而无限减仓
+            # 只有完全清仓时，成本才会归零
+            my_holdings_before = self.portfolio[token_mint]['my_balance']
+            
+            if my_holdings_before > 0:
+                # 只减少余额，成本保持不变
+                self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+            else:
+                # 如果余额异常（理论上不应该发生），直接删除记录
+                logger.warning(f"⚠️ [异常] {token_mint[:6]}... 卖出时余额异常 ({my_holdings_before})，直接清仓")
+                if token_mint in self.portfolio:
+                    del self.portfolio[token_mint]
+                # 直接返回，不继续后续逻辑
+                self._save_portfolio()
+                self._record_history("SELL", token_mint, amount_to_sell, est_sol_out)
+                return
 
             # 更新卖出计数缓存
             self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
 
+            # 🛡️ V4 Pro: 只有在完全清仓时，才删除记录（成本归零）
             if self.portfolio[token_mint]['my_balance'] < 100:
                 del self.portfolio[token_mint]
-                logger.info(f"✅ {token_mint[:6]}... 已清仓完毕")
+                logger.info(f"✅ {token_mint[:6]}... 已清仓完毕（成本已归零）")
                 logger.info(f"🧹 正在尝试回收账户租金...")
                 await asyncio.sleep(2)
                 # 🔥 修复：添加异常处理，防止任务失败静默
@@ -458,12 +495,28 @@ class PortfolioManager:
                                 )
 
                                 if success:
-                                    # 先保存剩余仓位（在删除之前）
-                                    remaining_balance = self.portfolio[token_mint]['my_balance'] - amount_to_sell
+                                    # 🛡️ V4 Pro: 按比例卖出时只减少余额，不减少成本
+                                    # 原因：避免因为收益达到设定限制而无限减仓
+                                    # 只有完全清仓时，成本才会归零
+                                    my_holdings_before = self.portfolio[token_mint]['my_balance']
                                     
-                                    self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+                                    # 先保存剩余仓位（在删除之前）
+                                    remaining_balance = my_holdings_before - amount_to_sell
+                                    
+                                    # 只减少余额，成本保持不变
+                                    if my_holdings_before > 0:
+                                        self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+                                    else:
+                                        # 如果余额异常（理论上不应该发生），直接删除记录
+                                        logger.warning(f"⚠️ [异常] {token_mint[:6]}... 止盈卖出时余额异常 ({my_holdings_before})，直接清仓")
+                                        if token_mint in self.portfolio:
+                                            del self.portfolio[token_mint]
+                                        # 直接返回，不继续后续逻辑
+                                        self._save_portfolio()
+                                        self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)
+                                        return
 
-                                    # 如果是全清，才删除数据和关账户
+                                    # 如果是全清，才删除数据和关账户（成本归零）
                                     if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
                                         if token_mint in self.portfolio:
                                             del self.portfolio[token_mint]
@@ -475,11 +528,6 @@ class PortfolioManager:
                                             except Exception as e:
                                                 logger.error(f"⚠️ 关闭账户失败: {e}")
                                         asyncio.create_task(safe_close_account())
-                                    else:
-                                        # 如果是留种，仅仅把成本归零（因为已经回本了），让它变成"零成本持仓"
-                                        # 这样下次就不会再基于旧成本计算 ROI 了，或者你可以选择不更新成本，继续监控
-                                        # 这里简单处理：更新余额即可，下次循环如果 ROI 还在涨，还会继续卖 80% 的 80%...
-                                        pass
 
                                     self._save_portfolio()
                                     self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out)

@@ -43,7 +43,17 @@ MIN_LIQUIDITY_USD = int(os.getenv("MIN_LIQUIDITY_USD", 3000))
 MAX_FDV = int(os.getenv("MAX_FDV", 5000000))                            
 MIN_FDV = int(os.getenv("MIN_FDV", 0))                                  
 MIN_SMART_MONEY_COST = float(os.getenv("MIN_SMART_MONEY_COST", 1.0))
-MAX_BUY_TIME = int(os.getenv("MAX_BUY_TIME", 3))
+
+# 🛡️ V4 Pro 双重熔断风控机制
+# 1. 【核心风控】单币最大持仓成本 (SOL)
+# 只要在这个币上总共花的钱没超过这个值，就会一直跟单
+# 只有在完全清仓后，成本才会归零，可以重新买入
+MAX_POSITION_SOL = float(os.getenv("MAX_POSITION_SOL", 2.0))
+
+# 2. 【频次风控】单币最大买入次数硬限制
+# 给一个宽松的上限（如 20 次），仅用于防止 API 被刷爆或恶意脚本
+# 买入次数不会在清仓后清零，是累计的
+MAX_BUY_COUNTS_HARD_LIMIT = int(os.getenv("MAX_BUY_COUNTS_HARD_LIMIT", 20))
 
 # --- 邮箱配置 ---
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
