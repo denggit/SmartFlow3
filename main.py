@@ -31,27 +31,28 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
         pm: PortfolioManager实例
     """
     try:
-        logger.debug(f"🔍 开始处理交易: {signature[:16]}...")
+        logger.info(f"🔍 [处理中] 开始处理交易: {signature[:16]}...")
         tx_detail = await fetch_transaction_details(session, signature)
         # 如果获取失败，直接返回
         if not tx_detail:
-            logger.warning(f"⚠️ 无法获取交易详情: {signature[:16]}... (可能交易还未被索引)")
+            logger.warning(f"⚠️ [处理失败] 无法获取交易详情: {signature[:16]}... (可能交易还未被索引)")
             return
 
         trade = parse_tx(tx_detail)
         if not trade or not trade['token_address']:
-            logger.debug(f"⚠️ 交易解析失败或非代币交易: {signature[:16]}... (可能是普通转账或其他操作)")
+            logger.info(f"ℹ️ [跳过] 交易解析失败或非代币交易: {signature[:16]}... (可能是普通转账或其他操作)")
             return
 
         token = trade['token_address']
         action = trade.get('action', 'UNKNOWN')
-        logger.debug(f"📊 解析到交易: {action} | 代币: {token[:16]}...")
+        logger.info(f"📊 [解析成功] {action} | 代币: {token[:16]}...")
 
         if trade['action'] == "BUY":
             # --- 1. 大哥试盘过滤 ---
             smart_money_cost = trade.get('sol_spent', 0)
+            logger.info(f"💰 [买入检测] 代币: {token[:16]}... | 大哥花费: {smart_money_cost:.4f} SOL")
             if smart_money_cost < MIN_SMART_MONEY_COST:
-                logger.debug(f"📉 [过滤] {token[:16]}... 买入金额过小: {smart_money_cost:.4f} SOL < {MIN_SMART_MONEY_COST} SOL")
+                logger.info(f"📉 [过滤] {token[:16]}... 买入金额过小: {smart_money_cost:.4f} SOL < {MIN_SMART_MONEY_COST} SOL")
                 return
 
             # --- 2. 基础风控 ---
@@ -152,13 +153,17 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                     logger.error(f"❌ 跟单失败: {token} | Swap执行返回False，请查看上方详细错误日志")
 
         elif trade['action'] == "SELL":
+            logger.info(f"📤 [卖出检测] 代币: {token[:16]}... | 大哥卖出数量: {trade.get('amount', 0)}")
             # 🔥 修复：添加锁保护，防止并发卖出导致的数据不一致
             async with pm.get_token_lock(token):
                 await pm.execute_proportional_sell(token, trade['amount'])
+            logger.info(f"✅ [卖出完成] 代币: {token[:16]}... 已按比例卖出")
+        else:
+            logger.info(f"ℹ️ [未知操作] 交易类型: {action} | 代币: {token[:16]}... (跳过处理)")
 
     except Exception as e:
         # 🔥 全局异常捕获：如果哪里再报错，这里会打印出来！
-        logger.error(f"💥 处理交易发生崩溃: {e}")
+        logger.error(f"💥 [处理异常] 交易 {signature[:16]}... 处理失败: {e}")
         logger.error(traceback.format_exc())
 
 
