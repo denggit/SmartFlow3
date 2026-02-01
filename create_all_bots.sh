@@ -4,7 +4,13 @@
 # 注意: 使用完整路径启动，方便在ps命令中区分不同的bot
 
 cd /root/project/botA_tugou && nohup python /root/project/botA_tugou/main.py > A.out 2>&1 &
+echo "✅ BotA 已启动，等待60秒后启动下一个..."
+sleep 60
+
 cd /root/project/botB_stable && nohup python /root/project/botB_stable/main.py > B.out 2>&1 &
+echo "✅ BotB 已启动，等待60秒后启动下一个..."
+sleep 60
+
 cd /root/project/botC_diamond && nohup python /root/project/botC_diamond/main.py > C.out 2>&1 &
 
 echo "✅ 所有Bot进程已启动"

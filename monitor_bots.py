@@ -6,16 +6,16 @@
 @File       : monitor_bots.py
 @Description: Bot进程监控守护程序 - 自动检测并重启挂掉的进程
 """
-import os
+import logging
+import subprocess
 import sys
 import time
-import subprocess
-import logging
-import psutil
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import psutil
 
 
 @dataclass
@@ -43,7 +43,7 @@ class ProcessChecker:
     
     使用策略模式，便于后续扩展不同的检查方式
     """
-    
+
     @staticmethod
     def is_process_running(script_path: str) -> bool:
         """
@@ -58,7 +58,7 @@ class ProcessChecker:
         try:
             script_name = Path(script_path).name
             script_dir = str(Path(script_path).parent)
-            
+
             # 遍历所有Python进程
             for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cwd']):
                 try:
@@ -78,7 +78,7 @@ class ProcessChecker:
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     # 进程可能已经结束或没有权限访问，继续检查下一个
                     continue
-                    
+
             return False
         except Exception as e:
             logging.warning(f"检查进程时出错: {e}")
@@ -91,7 +91,7 @@ class ProcessStarter:
     
     使用策略模式，便于后续扩展不同的启动方式
     """
-    
+
     @staticmethod
     def start_bot(config: BotConfig) -> Tuple[bool, Optional[str]]:
         """
@@ -107,13 +107,13 @@ class ProcessStarter:
             project_path = Path(config.project_dir)
             if not project_path.exists():
                 return False, f"项目目录不存在: {config.project_dir}"
-            
+
             main_script_path = project_path / config.main_script
             if not main_script_path.exists():
                 return False, f"主脚本不存在: {main_script_path}"
-            
+
             log_file_path = project_path / config.log_file
-            
+
             # 使用绝对路径启动进程，方便在ps命令中区分不同的bot
             # 切换到项目目录并启动进程
             main_script_abs_path = str(main_script_path.resolve())  # 确保使用绝对路径
@@ -126,7 +126,7 @@ class ProcessStarter:
                 '2>&1',
                 '&'
             ]
-            
+
             # 使用shell=True来支持重定向和后台运行
             subprocess.Popen(
                 ' '.join(cmd),
@@ -135,16 +135,16 @@ class ProcessStarter:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            
+
             # 等待一小段时间，确认进程启动
             time.sleep(2)
-            
+
             # 验证进程是否真的启动了
             if ProcessChecker.is_process_running(str(main_script_path)):
                 return True, None
             else:
                 return False, "进程启动后验证失败"
-                
+
         except Exception as e:
             return False, f"启动进程时发生异常: {str(e)}"
 
@@ -155,7 +155,7 @@ class BotMonitor:
     
     使用观察者模式和策略模式，确保模块解耦
     """
-    
+
     def __init__(self, bots: List[BotConfig], check_interval: int = 30):
         """
         初始化监控器
@@ -169,7 +169,7 @@ class BotMonitor:
         self.process_checker = ProcessChecker()
         self.process_starter = ProcessStarter()
         self.logger = self._setup_logger()
-        
+
     def _setup_logger(self) -> logging.Logger:
         """
         设置日志记录器
@@ -179,20 +179,20 @@ class BotMonitor:
         """
         logger = logging.getLogger('BotMonitor')
         logger.setLevel(logging.INFO)
-        
+
         # 创建日志目录
         log_dir = Path(__file__).parent / 'log'
         log_dir.mkdir(exist_ok=True)
-        
+
         # 文件处理器
         log_file = log_dir / f"monitor_{datetime.now().strftime('%Y-%m-%d')}.log"
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
-        
+
         # 控制台处理器
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
-        
+
         # 格式化器
         formatter = logging.Formatter(
             '%(asctime)s | %(levelname)s | %(message)s',
@@ -200,12 +200,12 @@ class BotMonitor:
         )
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
-        
+
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
-        
+
         return logger
-    
+
     def check_bot(self, config: BotConfig) -> bool:
         """
         检查单个bot进程状态
@@ -218,7 +218,7 @@ class BotMonitor:
         """
         main_script_path = Path(config.project_dir) / config.main_script
         return self.process_checker.is_process_running(str(main_script_path))
-    
+
     def restart_bot(self, config: BotConfig) -> bool:
         """
         重启bot进程
@@ -231,24 +231,36 @@ class BotMonitor:
         """
         self.logger.warning(f"🔄 [{config.name}] 检测到进程挂掉，正在重启...")
         success, error_msg = self.process_starter.start_bot(config)
-        
+
         if success:
             self.logger.info(f"✅ [{config.name}] 进程重启成功")
             return True
         else:
             self.logger.error(f"❌ [{config.name}] 进程重启失败: {error_msg}")
             return False
-    
+
     def monitor_once(self) -> None:
         """
         执行一次监控检查
+        
+        如果发现多个bot挂掉，重启时会间隔60秒，避免同时启动造成资源竞争
         """
+        # 先收集所有需要重启的bot
+        bots_to_restart = []
         for bot_config in self.bots:
             if not self.check_bot(bot_config):
-                self.restart_bot(bot_config)
+                bots_to_restart.append(bot_config)
             else:
                 self.logger.debug(f"✓ [{bot_config.name}] 进程运行正常")
-    
+
+        # 逐个重启，每个之间间隔60秒
+        for idx, bot_config in enumerate(bots_to_restart):
+            if idx > 0:
+                # 不是第一个需要重启的bot，等待60秒
+                self.logger.info(f"⏳ 等待60秒后重启下一个bot...")
+                time.sleep(60)
+            self.restart_bot(bot_config)
+
     def run(self) -> None:
         """
         运行监控循环
@@ -260,7 +272,7 @@ class BotMonitor:
             self.logger.info(f"   - {bot.name}: {bot.project_dir}")
         self.logger.info(f"⏱️  检查间隔: {self.check_interval} 秒")
         self.logger.info("=" * 60)
-        
+
         try:
             while True:
                 self.monitor_once()
@@ -280,7 +292,7 @@ def create_bot_configs() -> List[BotConfig]:
         List[BotConfig]: Bot配置列表
     """
     base_path = "/root/project"
-    
+
     bots = [
         BotConfig(
             name="botA_tugou",
@@ -301,7 +313,7 @@ def create_bot_configs() -> List[BotConfig]:
             log_file="B.out"
         ),
     ]
-    
+
     return bots
 
 
@@ -311,7 +323,7 @@ def main():
     """
     # 创建bot配置
     bots = create_bot_configs()
-    
+
     # 创建监控器并运行
     monitor = BotMonitor(bots, check_interval=30)
     monitor.run()
