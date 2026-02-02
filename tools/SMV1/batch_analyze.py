@@ -13,6 +13,7 @@
 import asyncio
 import logging
 import os
+import re
 import statistics
 import sys
 from datetime import datetime
@@ -42,13 +43,92 @@ logger = logging.getLogger(__name__)
 
 # === ⚙️ 配置常量 ===
 # 文件路径：指向 tools 目录（父目录）
-TOOLS_DIR = Path(__file__).parent
+TOOLS_DIR = Path(__file__).parent.parent
 TRASH_FILE = str(TOOLS_DIR / "wallets_trash.txt")
-WALLETS_FILE = str(TOOLS_DIR / "wallets.txt")
+WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
 RESULTS_DIR = str(TOOLS_DIR / "results")
 MIN_SCORE_THRESHOLD_1 = 45  # 评分阈值1：低于此值且代币数>=10时加入黑名单
 MIN_SCORE_THRESHOLD_2 = 20  # 评分阈值2：低于此值直接加入黑名单
 CONCURRENT_LIMIT = 1  # 并发限制
+
+
+def is_valid_solana_address(address: str) -> bool:
+    """
+    验证是否为有效的 Solana 钱包地址
+    
+    Args:
+        address: 待验证的地址字符串
+        
+    Returns:
+        是否为有效的 Solana 地址
+    """
+    if not address or not isinstance(address, str):
+        return False
+    
+    # Solana 地址长度通常在 32-44 位，使用 Base58 字符集
+    if not (32 <= len(address) <= 44):
+        return False
+    
+    # Base58 字符集：不包含 0, O, I, l
+    if not re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', address):
+        return False
+    
+    # 排除系统地址
+    if address == "So11111111111111111111111111111111111111111":
+        return False
+    
+    return True
+
+
+class WalletListSaver:
+    """
+    钱包列表保存器：负责将有效的钱包地址保存回文件
+    """
+    
+    @staticmethod
+    def save_valid_addresses(
+        addresses: List[str],
+        wallets_file: str = WALLETS_FILE
+    ) -> bool:
+        """
+        保存有效的钱包地址到文件（去重、验证格式）
+        
+        Args:
+            addresses: 钱包地址列表
+            wallets_file: 钱包列表文件路径
+            
+        Returns:
+            是否成功保存
+        """
+        if not addresses:
+            logger.warning("没有地址需要保存")
+            return False
+        
+        try:
+            # 验证并去重
+            valid_addresses = set()
+            for addr in addresses:
+                addr = addr.strip()
+                if addr and is_valid_solana_address(addr):
+                    valid_addresses.add(addr)
+            
+            if not valid_addresses:
+                logger.warning("没有有效的钱包地址需要保存")
+                return False
+            
+            # 排序并保存
+            sorted_addresses = sorted(list(valid_addresses))
+            
+            with open(wallets_file, 'w', encoding='utf-8') as f:
+                for addr in sorted_addresses:
+                    f.write(f"{addr}\n")
+            
+            logger.info(f"已保存 {len(sorted_addresses)} 个有效钱包地址到 {wallets_file}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"保存钱包地址失败: {e}")
+            return False
 
 
 class TrashListManager:
@@ -160,6 +240,7 @@ class WalletListLoader:
                     for line in f
                     if line.strip() and not line.startswith("#")
                 ]
+                addresses = list(set(addresses))
             logger.info(f"从 {wallets_file} 加载了 {len(addresses)} 个地址")
             return addresses
         except Exception as e:
@@ -390,6 +471,32 @@ async def main():
             print("\n⚠️ 导出失败")
     else:
         print("\n🏁 分析结果为空，请检查报错或地址列表。")
+    
+    # 收集所有有效的钱包地址（从分析结果和原始列表中提取）
+    valid_addresses = set()
+    
+    # 1. 从分析结果中提取（这些是成功分析的钱包）
+    if results:
+        for r in results:
+            addr = r.get('钱包地址', '').strip()
+            if addr and is_valid_solana_address(addr):
+                valid_addresses.add(addr)
+    
+    # 2. 从原始列表中提取（包括未分析但格式正确的地址）
+    for addr in all_addresses:
+        addr = addr.strip()
+        if addr and is_valid_solana_address(addr):
+            valid_addresses.add(addr)
+    
+    # 3. 保存有效的钱包地址回文件
+    if valid_addresses:
+        saved = WalletListSaver.save_valid_addresses(list(valid_addresses), WALLETS_FILE)
+        if saved:
+            print(f"\n✅ 已过滤并保存 {len(valid_addresses)} 个有效钱包地址到 {WALLETS_FILE}")
+        else:
+            print(f"\n⚠️ 保存钱包地址失败")
+    else:
+        print(f"\n⚠️ 未找到有效的钱包地址")
 
 
 if __name__ == "__main__":

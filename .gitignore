@@ -2,11 +2,12 @@
 /log/
 /data/
 /tools/wallets_ori.txt
-/tools/smart_money/gmgn.ai.har
-/tools/smart_money/wallets.txt
+/tools/gmgn.ai.har
+/tools/wallets.txt
 /tools/wallets_trash.txt
 /tools/results/
 /bota.env
 /botb.env
 /botc.env
 /create_all_bots.sh
+/tools/wallets_check.txt
