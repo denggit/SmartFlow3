@@ -12,27 +12,34 @@
 """
 import argparse
 import asyncio
+import json
 import logging
 import os
 import statistics
 import sys
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
+import duckdb
 
 # 导入配置
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from config.settings import HELIUS_API_KEY, JUPITER_API_KEY
 
 # === ⚙️ 基础配置 ===
-TARGET_TX_COUNT = 20000
+TARGET_TX_COUNT = 2000
 JUPITER_QUOTE_TIMEOUT = 5  # 降低超时时间以提升速度
 JUPITER_MAX_RETRIES = 1  # 减少重试次数以提升速度
 MIN_COST_THRESHOLD = 0.05  # 最小成本阈值
 DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# 数据库配置
+DB_DIR = Path(__file__).parent / "data"
+DB_FILE = DB_DIR / "transactions.duckdb"
 
 # === 🎯 V2 评分阈值配置 ===
 # 垃圾地址识别阈值
@@ -54,6 +61,166 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class TransactionDBManager:
+    """
+    交易记录数据库管理器：使用DuckDB存储和查询交易记录
+    
+    职责：
+    - 初始化数据库和表结构
+    - 查询指定地址的交易记录
+    - 保存交易记录到数据库
+    - 管理数据库连接和事务
+    """
+    
+    def __init__(self, db_file: Path = DB_FILE):
+        """
+        初始化数据库管理器
+        
+        Args:
+            db_file: 数据库文件路径
+        """
+        self.db_file = db_file
+        # 确保数据库目录存在
+        self.db_file.parent.mkdir(parents=True, exist_ok=True)
+        self._init_database()
+    
+    def _init_database(self):
+        """
+        初始化数据库和表结构
+        """
+        try:
+            conn = duckdb.connect(str(self.db_file))
+            # 创建表：address (TEXT), signature (TEXT PRIMARY KEY), transaction_data (JSON)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transactions (
+                    address TEXT NOT NULL,
+                    signature TEXT NOT NULL PRIMARY KEY,
+                    transaction_data JSON NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # 创建索引以加速查询
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_address ON transactions(address)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signature ON transactions(signature)")
+            conn.close()
+            logger.info(f"数据库初始化完成: {self.db_file}")
+        except Exception as e:
+            logger.error(f"数据库初始化失败: {e}")
+            raise
+    
+    def get_transactions(self, address: str, limit: Optional[int] = None) -> List[dict]:
+        """
+        获取指定地址的交易记录（按时间倒序，最新的在前）
+        
+        Args:
+            address: 钱包地址
+            limit: 最大返回数量，None表示返回所有
+            
+        Returns:
+            交易记录列表（按时间倒序）
+        """
+        try:
+            conn = duckdb.connect(str(self.db_file))
+            query = """
+                SELECT transaction_data
+                FROM transactions
+                WHERE address = ?
+                ORDER BY created_at DESC
+            """
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            result = conn.execute(query, [address]).fetchall()
+            conn.close()
+            
+            # 解析JSON数据
+            transactions = []
+            for row in result:
+                try:
+                    tx_data = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    transactions.append(tx_data)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"解析交易数据失败: {e}")
+                    continue
+            
+            logger.debug(f"从数据库读取到 {len(transactions)} 条交易记录: {address[:8]}...")
+            return transactions
+        except Exception as e:
+            logger.error(f"查询交易记录失败: {e}")
+            return []
+    
+    def save_transactions(self, address: str, transactions: List[dict]):
+        """
+        保存交易记录到数据库（去重）
+        
+        Args:
+            address: 钱包地址
+            transactions: 交易记录列表
+        """
+        if not transactions:
+            return
+        
+        try:
+            conn = duckdb.connect(str(self.db_file))
+            
+            # 获取已有的signature集合
+            existing_sigs = set()
+            result = conn.execute(
+                "SELECT signature FROM transactions WHERE address = ?",
+                [address]
+            ).fetchall()
+            existing_sigs = {row[0] for row in result}
+            
+            # 插入新交易（去重）
+            new_count = 0
+            for tx in transactions:
+                signature = tx.get('signature')
+                if not signature or signature in existing_sigs:
+                    continue
+                
+                try:
+                    tx_json = json.dumps(tx, ensure_ascii=False) if not isinstance(tx, str) else tx
+                    conn.execute(
+                        "INSERT INTO transactions (address, signature, transaction_data) VALUES (?, ?, ?)",
+                        [address, signature, tx_json]
+                    )
+                    existing_sigs.add(signature)
+                    new_count += 1
+                except Exception as e:
+                    logger.warning(f"插入交易记录失败 {signature[:8]}...: {e}")
+                    continue
+            
+            conn.commit()
+            conn.close()
+            
+            if new_count > 0:
+                logger.debug(f"已保存 {new_count} 条新交易记录到数据库: {address[:8]}...")
+        except Exception as e:
+            logger.error(f"保存交易记录到数据库失败: {e}")
+    
+    def get_transaction_count(self, address: str) -> int:
+        """
+        获取指定地址的交易记录数量
+        
+        Args:
+            address: 钱包地址
+            
+        Returns:
+            交易记录数量
+        """
+        try:
+            conn = duckdb.connect(str(self.db_file))
+            result = conn.execute(
+                "SELECT COUNT(*) FROM transactions WHERE address = ?",
+                [address]
+            ).fetchone()
+            conn.close()
+            return result[0] if result else 0
+        except Exception as e:
+            logger.error(f"查询交易记录数量失败: {e}")
+            return 0
 
 
 class TransactionParser:
@@ -246,15 +413,8 @@ class PriceFetcher:
                 if result is not None and result > 0:
                     prices[mint] = result
                     self._price_cache[mint] = result
-
-                # API调用间隔：除了最后一个，每个调用后等待1秒
-                if i < len(uncached_mints) - 1:
-                    await asyncio.sleep(1.0)
             except Exception as e:
                 logger.debug(f"获取 {mint[:8]}... 价格失败: {e}")
-                # 即使失败也要等待，确保API调用间隔
-                if i < len(uncached_mints) - 1:
-                    await asyncio.sleep(1.0)
                 continue
 
         # 合并缓存和查询结果
@@ -308,10 +468,6 @@ class PriceFetcher:
                 "onlyDirectRoutes": "false",
             }
 
-            # 不同quote_amount之间等待1秒
-            if quote_idx > 0:
-                await asyncio.sleep(1.0)
-
             for attempt in range(max_retries):
                 try:
                     async with self.session.get(url, params=params, headers=headers, timeout=timeout) as resp:
@@ -322,42 +478,43 @@ class PriceFetcher:
                                 decimals = 6 if quote_amount == int(1e6) else (9 if quote_amount == int(1e9) else 8)
                                 price_sol = (out_amount / 1e9) / (quote_amount / (10 ** decimals))
                                 if 0.000001 <= price_sol <= 1000:
-                                    # 成功获取价格后，等待1秒（为下一个API调用做准备）
-                                    await asyncio.sleep(1.0)
                                     return price_sol
-                            # 即使out_amount为0，也要等待1秒
-                            await asyncio.sleep(1.0)
+                            # out_amount为0，尝试下一个quote_amount
+                            break
                         elif resp.status == 429:
-                            wait_time = max((attempt + 1) * 2, 1)  # 至少等待1秒
-                            logger.debug(f"Jupiter rate limited, waiting {wait_time}s")
+                            # 429错误：尝试读取Retry-After头，否则使用指数退避
+                            retry_after = resp.headers.get('Retry-After')
+                            if retry_after:
+                                try:
+                                    wait_time = float(retry_after)
+                                except (ValueError, TypeError):
+                                    wait_time = min((attempt + 1) * 2, 60)  # 最多等待60秒
+                            else:
+                                # 指数退避：2秒、4秒、8秒...最多60秒
+                                wait_time = min(2 ** (attempt + 1), 60)
+                            logger.warning(f"Jupiter API rate limited (429), waiting {wait_time}s before retry")
                             await asyncio.sleep(wait_time)
                             continue
                         else:
-                            # 非200状态码，等待1秒
-                            await asyncio.sleep(1.0)
+                            # 非200状态码，记录日志但不重试（除非是最后一次尝试）
+                            logger.debug(f"Jupiter API returned status {resp.status} for {token_mint[:8]}...")
                             if attempt < max_retries - 1:
                                 continue
                             else:
                                 break
                 except asyncio.TimeoutError:
-                    # 超时后等待1秒
-                    await asyncio.sleep(1.0)
+                    # 超时错误，记录日志但不等待（除非是最后一次尝试）
+                    logger.debug(f"Jupiter API timeout for {token_mint[:8]}...")
                     if attempt < max_retries - 1:
                         continue
                     else:
                         break
                 except Exception as e:
                     logger.debug(f"Jupiter API error for {token_mint[:8]}...: {e}")
-                    # 异常后等待1秒
-                    await asyncio.sleep(1.0)
                     if attempt < max_retries - 1:
                         continue
                     else:
                         break
-
-                # 每次尝试之间等待1秒（除了最后一次）
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1.0)
 
         return None
 
@@ -373,16 +530,18 @@ class WalletAnalyzerV2:
     - 生成详细分析报告
     """
 
-    def __init__(self, helius_api_key: str = None):
+    def __init__(self, helius_api_key: str = None, db_manager: Optional[TransactionDBManager] = None):
         """
         初始化钱包分析器
         
         Args:
             helius_api_key: Helius API 密钥
+            db_manager: 交易记录数据库管理器（可选）
         """
         self.helius_api_key = helius_api_key or HELIUS_API_KEY
         if not self.helius_api_key:
             raise ValueError("HELIUS_API_KEY 未配置")
+        self.db_manager = db_manager
 
     async def fetch_history_pagination(
             self,
@@ -392,7 +551,12 @@ class WalletAnalyzerV2:
             helius_api_key=None
     ) -> List[dict]:
         """
-        分页获取钱包交易历史
+        分页获取钱包交易历史（支持数据库缓存和智能分页）
+        
+        策略：
+        1. 先从数据库查询缓存
+        2. 逐页拉取Helius最新数据，检测重叠
+        3. 如果重叠但数据不足，向后拉更老的数据
         
         Args:
             session: aiohttp 会话对象
@@ -401,19 +565,30 @@ class WalletAnalyzerV2:
             helius_api_key: Helius API Key
 
         Returns:
-            交易列表
+            交易列表（按时间倒序，最新的在前）
         """
-        all_txs = []
-        last_signature = None
+        page_size = 100
         retry_count = 0
         max_retries = 5
-
-        while len(all_txs) < max_count:
+        
+        # 1. 从数据库读取缓存
+        cached_txs = []
+        cached_signatures = set()
+        if self.db_manager:
+            cached_txs = self.db_manager.get_transactions(address, limit=max_count)
+            cached_signatures = {tx.get('signature') for tx in cached_txs if tx.get('signature')}
+            logger.debug(f"从数据库读取到 {len(cached_txs)} 条缓存交易: {address[:8]}...")
+        
+        # 2. 逐页拉取Helius最新数据
+        new_txs = []
+        last_signature = None
+        overlap_found = False
+        
+        while len(new_txs) < max_count:
             url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
             params = {
                 "api-key": helius_api_key,
-                # "type": "SWAP",
-                "limit": 100
+                "limit": page_size
             }
             if last_signature:
                 params["before"] = last_signature
@@ -423,28 +598,56 @@ class WalletAnalyzerV2:
                     if resp.status == 429:
                         retry_count += 1
                         if retry_count > max_retries:
-                            logger.warning(f"Rate limit exceeded, stopping at {len(all_txs)} transactions")
+                            logger.warning(f"Helius API rate limit exceeded after {max_retries} retries, stopping at {len(new_txs)} transactions")
                             break
-                        wait_time = retry_count * 2
-                        logger.info(f"Rate limited, waiting {wait_time}s")
+                        # 尝试读取Retry-After头，否则使用指数退避
+                        retry_after = resp.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                wait_time = float(retry_after)
+                            except (ValueError, TypeError):
+                                wait_time = min(retry_count * 2, 60)  # 最多等待60秒
+                        else:
+                            # 指数退避：2秒、4秒、8秒...最多60秒
+                            wait_time = min(2 ** retry_count, 60)
+                        logger.warning(f"Helius API rate limited (429), waiting {wait_time}s before retry ({retry_count}/{max_retries})")
                         await asyncio.sleep(wait_time)
                         continue
 
                     if resp.status != 200:
-                        logger.warning(f"API returned status {resp.status}, stopping")
+                        logger.warning(f"Helius API returned status {resp.status}, stopping")
                         break
 
                     data = await resp.json()
                     if not data:
                         break
 
-                    all_txs.extend(data)
-                    if len(data) < 100:
+                    # 检测重叠
+                    page_overlap = False
+                    for tx in data:
+                        sig = tx.get('signature')
+                        if sig and sig in cached_signatures:
+                            page_overlap = True
+                            overlap_found = True
+                            break
+                    
+                    # 添加新交易（去重）
+                    for tx in data:
+                        sig = tx.get('signature')
+                        if sig and sig not in cached_signatures:
+                            new_txs.append(tx)
+                            cached_signatures.add(sig)
+                    
+                    # 如果发现重叠，说明最新数据已经拉够了
+                    if page_overlap:
+                        logger.debug(f"发现重叠，停止拉取新数据: {address[:8]}... (已拉取 {len(new_txs)} 条新交易)")
+                        break
+                    
+                    if len(data) < page_size:
                         break
 
                     last_signature = data[-1].get('signature')
                     retry_count = 0
-                    await asyncio.sleep(1.0)  # API调用间隔至少1秒
 
             except aiohttp.ClientError as e:
                 logger.error(f"Network error fetching transactions: {e}")
@@ -452,8 +655,102 @@ class WalletAnalyzerV2:
             except Exception as e:
                 logger.error(f"Unexpected error fetching transactions: {e}")
                 break
-
-        return all_txs[:max_count]
+        
+        # 3. 合并新数据和缓存
+        all_txs = new_txs + cached_txs
+        older_txs = []  # 向后拉取的更老数据
+        
+        # 4. 如果出现重叠但数据量不足，向后拉更老的数据
+        if overlap_found and len(all_txs) < max_count:
+            # 计算需要跳过的页数
+            pages_to_skip = len(cached_txs) // page_size
+            if pages_to_skip > 0:
+                logger.debug(f"数据不足，向后拉取更老的数据: {address[:8]}... (跳过 {pages_to_skip} 页，已有 {len(cached_txs)} 条)")
+                
+                # 找到缓存中最老的交易signature作为起点
+                if cached_txs:
+                    oldest_signature = cached_txs[-1].get('signature')
+                    if oldest_signature:
+                        last_signature = oldest_signature
+                        retry_count = 0
+                        
+                        while len(all_txs) + len(older_txs) < max_count:
+                            url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
+                            params = {
+                                "api-key": helius_api_key,
+                                "limit": page_size,
+                                "before": last_signature
+                            }
+                            
+                            try:
+                                async with session.get(url, params=params) as resp:
+                                    if resp.status == 429:
+                                        retry_count += 1
+                                        if retry_count > max_retries:
+                                            break
+                                        retry_after = resp.headers.get('Retry-After')
+                                        if retry_after:
+                                            try:
+                                                wait_time = float(retry_after)
+                                            except (ValueError, TypeError):
+                                                wait_time = min(retry_count * 2, 60)
+                                        else:
+                                            wait_time = min(2 ** retry_count, 60)
+                                        logger.warning(f"Helius API rate limited (429), waiting {wait_time}s")
+                                        await asyncio.sleep(wait_time)
+                                        continue
+                                    
+                                    if resp.status != 200:
+                                        break
+                                    
+                                    data = await resp.json()
+                                    if not data:
+                                        break
+                                    
+                                    # 添加新交易（去重）
+                                    for tx in data:
+                                        sig = tx.get('signature')
+                                        if sig and sig not in cached_signatures:
+                                            older_txs.append(tx)
+                                            cached_signatures.add(sig)
+                                    
+                                    if len(data) < page_size:
+                                        break
+                                    
+                                    last_signature = data[-1].get('signature')
+                                    retry_count = 0
+                                    
+                                    if len(all_txs) + len(older_txs) >= max_count:
+                                        break
+                            
+                            except Exception as e:
+                                logger.error(f"Error fetching older transactions: {e}")
+                                break
+                        
+                        # 将更老的交易添加到末尾
+                        all_txs.extend(older_txs)
+        
+        # 5. 限制返回数量并去重
+        seen = set()
+        unique_txs = []
+        for tx in all_txs:
+            sig = tx.get('signature')
+            if sig and sig not in seen:
+                seen.add(sig)
+                unique_txs.append(tx)
+            if len(unique_txs) >= max_count:
+                break
+        
+        # 6. 保存新数据到数据库
+        if self.db_manager:
+            # 保存新拉取的数据
+            if new_txs:
+                self.db_manager.save_transactions(address, new_txs)
+            # 如果有向后拉取的数据，也保存
+            if older_txs:
+                self.db_manager.save_transactions(address, older_txs)
+        
+        return unique_txs[:max_count]
 
     async def parse_token_projects(
             self,

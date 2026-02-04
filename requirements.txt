@@ -17,3 +17,6 @@ solders>=0.18.0
 
 # 进程监控（可选，用于monitor_bots.py）
 psutil>=5.9.0
+
+# 数据库
+duckdb>=0.10.0

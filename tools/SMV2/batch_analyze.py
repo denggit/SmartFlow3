@@ -30,7 +30,7 @@ current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
 try:
-    from analyze_wallet import WalletAnalyzerV2, WalletScorerV2
+    from analyze_wallet import WalletAnalyzerV2, WalletScorerV2, TransactionDBManager
 except ImportError:
     print("❌ 错误：找不到 analyze_wallet 模块")
     sys.exit(1)
@@ -49,16 +49,18 @@ WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
 RESULTS_DIR = str(Path(__file__).parent / "results")
 CONCURRENT_LIMIT = 5  # 并发限制
 DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
+MAX_TXS = 500      # 最大交易数获取
 
 
 class APIKeyManager:
     """
-    API Key 管理器：负责管理多个 API Key，允许并行使用，但同一 Key 间隔至少1秒
+    API Key 管理器：负责管理多个 API Key，允许并行使用
     
     职责：
     - 为每个 Key 创建独立的锁，允许不同 Key 并行使用
-    - 跟踪每个 Key 的最后调用时间
-    - 确保同一 Key 的调用间隔至少1秒
+    - 同一 Key 的调用通过锁保证串行执行（无间隔限制）
+    - 轮询选择 Key，实现负载均衡
+    - 不限制调用间隔，但遇到429错误时会进行退避重试
     """
 
     def __init__(self, key_list: List[str], api_name: str = "API"):
@@ -75,53 +77,23 @@ class APIKeyManager:
         if not self.key_list:
             raise ValueError(f"{api_name} Key 列表中没有有效的 Key")
         self.api_name = api_name
-        # 为每个 Key 创建独立的锁和调用时间跟踪
+        # 为每个 Key 创建独立的锁
         self.key_locks: Dict[str, asyncio.Lock] = {key: asyncio.Lock() for key in self.key_list}
-        self.last_call_times: Dict[str, float] = {}  # {key: last_call_timestamp}
         self.current_index = 0
         self._index_lock = asyncio.Lock()  # 用于轮询选择Key的锁
-        logger.info(f"初始化 {api_name} Key 管理器: {len(self.key_list)} 个 Keys（支持并行）")
+        logger.info(f"初始化 {api_name} Key 管理器: {len(self.key_list)} 个 Keys（支持并行，无间隔限制）")
 
     async def get_key_and_lock(self) -> Tuple[str, asyncio.Lock]:
         """
-        获取下一个可用的 API Key 和对应的锁（确保间隔至少1秒）
+        获取下一个可用的 API Key 和对应的锁（轮询选择）
+        
+        注意：返回的锁用于保证同一Key的调用串行执行，但无时间间隔限制
         
         Returns:
-            (key, lock): 可用的 API Key 和对应的锁
+            (key, lock): 可用的 API Key 和对应的锁（使用 async with lock 来保证串行）
         """
-        import time
         async with self._index_lock:
-            current_time = time.time()
-
-            # 尝试找到可用的 Key（距离上次调用至少1秒）
-            for _ in range(len(self.key_list)):
-                key = self.key_list[self.current_index]
-                last_call = self.last_call_times.get(key, 0)
-                elapsed = current_time - last_call
-
-                if elapsed >= 1.0:
-                    # 这个 Key 可用，更新调用时间并返回
-                    self.last_call_times[key] = current_time
-                    self.current_index = (self.current_index + 1) % len(self.key_list)
-                    return key, self.key_locks[key]
-
-                # 这个 Key 不可用，尝试下一个
-                self.current_index = (self.current_index + 1) % len(self.key_list)
-
-            # 如果所有 Key 都不可用，等待最短的时间
-            if self.last_call_times:
-                wait_times = [1.0 - (current_time - last_call)
-                              for last_call in self.last_call_times.values()
-                              if (current_time - last_call) < 1.0]
-                if wait_times:
-                    min_wait = min(wait_times)
-                    if min_wait > 0:
-                        await asyncio.sleep(min_wait)
-                        current_time = time.time()
-
-            # 再次尝试获取 Key（此时应该至少有一个可用）
             key = self.key_list[self.current_index]
-            self.last_call_times[key] = current_time
             self.current_index = (self.current_index + 1) % len(self.key_list)
             return key, self.key_locks[key]
 
@@ -380,7 +352,7 @@ class BatchAnalyzerV2:
         """
         try:
             # === 阶段1：API调用（允许N个Key并行，N=key数量，但同一Key内部串行）===
-            # 获取可用的Helius Key和对应的锁（确保同一Key间隔1秒）
+            # 获取可用的Helius Key和对应的锁（确保同一Key串行调用，无间隔限制）
             helius_key, helius_lock = await self.helius_key_manager.get_key_and_lock()
             async with helius_lock:
                 # 1. 拉取交易数据（Helius API）
@@ -796,8 +768,11 @@ async def main():
     logger.info(f"已配置 {len(helius_keys)} 个 Helius API Keys")
     logger.info(f"已配置 {len(jupiter_keys)} 个 Jupiter API Keys")
 
+    # 初始化数据库管理器
+    db_manager = TransactionDBManager()
+    
     # 初始化组件
-    analyzer = WalletAnalyzerV2()  # 不需要传入key，因为会在调用时动态获取
+    analyzer = WalletAnalyzerV2(db_manager=db_manager)  # 传入数据库管理器以支持缓存
     trash_manager = TrashListManager()
     batch_analyzer = BatchAnalyzerV2(
         analyzer,
@@ -827,7 +802,7 @@ async def main():
     print(f"🚀 启动批量分析 V2 (超严格版) | 任务数: {len(addresses)} (跳过黑名单: {skip_count})")
 
     # 执行批量分析（每20个钱包自动保存一次）
-    results = await batch_analyzer.analyze_batch(addresses, save_interval=20, exporter=exporter)
+    results = await batch_analyzer.analyze_batch(addresses, max_txs=MAX_TXS, save_interval=20, exporter=exporter)
 
     # 导出最终结果（覆盖临时文件或创建新文件）
     if results:
