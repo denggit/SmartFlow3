@@ -44,7 +44,7 @@ WALLETS_FILE = str(TOOLS_DIR / "wallets_check.txt")
 RESULTS_DIR = str(Path(__file__).parent / "results")
 CONCURRENT_LIMIT = 5  # 并发限制
 DUST_THRESHOLD = 0.01  # 粉尘阈值：未实现收益低于此值的代币视为粉尘
-MAX_TXS = 500  # 最大交易数获取
+MAX_TXS = 1000  # 最大交易数获取
 
 
 class APIKeyManager:
