@@ -515,6 +515,27 @@ class BatchAnalyzerV2:
                 profit_pct_excluding_max = profit_dim.get("profit_pct_excluding_max", 0)
                 roi_excluding_max = profit_pct_excluding_max / 100  # 转换为小数形式（如 0.5 表示 50%）
 
+                # 12. 计算平均每次买入的SOL数量
+                # 从所有交易的 buy_sol 中提取，计算平均值
+                all_buy_amounts = []
+                for r in results:
+                    transactions = r.get("transactions", [])
+                    for tx in transactions:
+                        buy_sol = tx.get("buy_sol", 0)
+                        if buy_sol > 1e-9:  # 只统计有效的买入金额
+                            all_buy_amounts.append(buy_sol)
+                avg_buy_sol = sum(all_buy_amounts) / len(all_buy_amounts) if all_buy_amounts else 0
+
+                # 13. 计算已清仓代币的平均买入次数和卖出次数
+                # 只统计 remaining_tokens == 0 的代币（已完全清仓）
+                settled_tokens = [r for r in results if not r.get('is_unsettled', False) and r.get('remaining_tokens', 0) == 0]
+                if settled_tokens:
+                    avg_buy_count = sum(r.get('buy_count', 0) for r in settled_tokens) / len(settled_tokens)
+                    avg_sell_count = sum(r.get('sell_count', 0) for r in settled_tokens) / len(settled_tokens)
+                else:
+                    avg_buy_count = 0
+                    avg_sell_count = 0
+
                 pbar.update(1)
                 return {
                     "钱包地址": address,
@@ -551,7 +572,10 @@ class BatchAnalyzerV2:
                     "未结算ROI": f"{unsettled_roi:.1%}",
                     "未结算平均持仓(分钟)": round(unsettled_avg_hold_time, 1),
                     "单币亏损>95%数量": severe_loss_count,
-                    "去掉最高收益后整体ROI": f"{roi_excluding_max:.1%}",
+                    "去掉最高收益后整体ROI": roi_excluding_max,
+                    "平均每次买入(SOL)": round(avg_buy_sol, 3),
+                    "已清仓代币平均买入次数": round(avg_buy_count, 2),
+                    "已清仓代币平均卖出次数": round(avg_sell_count, 2),
                     "分析时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "🛡️ 稳健中军": positioning.get("🛡️ 稳健中军", 0),
                     "⚔️ 土狗猎手": positioning.get("⚔️ 土狗猎手", 0),
@@ -753,6 +777,7 @@ class ReportExporterV2:
                 "代币多样性", "30天代币数", "30天交易数", "7天代币数", "7天交易数",
                 "项目总数", "亏损代币数量", "未结算token数", "未结算盈利(SOL)", "未结算ROI", "未结算平均持仓(分钟)",
                 "单币亏损>95%数量", "去掉最高收益后整体ROI",
+                "平均每次买入(SOL)", "已清仓代币平均买入次数", "已清仓代币平均卖出次数",
                 "🛡️ 稳健中军", "⚔️ 土狗猎手", "💎 钻石之手", "🚀 短线高手",
                 "分析时间"
             ]

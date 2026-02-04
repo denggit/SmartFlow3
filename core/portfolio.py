@@ -16,7 +16,7 @@ import aiohttp
 
 # 导入配置和工具
 from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI, REPORT_HOUR, REPORT_MINUTE, \
-    TAKE_PROFIT_SELL_PCT, USDC_MINT
+    TAKE_PROFIT_SELL_PCT, STOP_LOSS_PCT, USDC_MINT
 from services.notification import send_email_async
 from utils.logger import logger
 
@@ -749,6 +749,198 @@ class PortfolioManager:
     
                         except Exception as e:
                             logger.error(f"盯盘异常: {e}")
+
+                await asyncio.sleep(10)
+
+    async def monitor_stop_loss(self):
+        """
+        止损监控线程：监控持仓亏损，当亏损达到止损百分比时触发止损卖出
+        
+        功能：
+        - 每10秒检查一次持仓
+        - 计算每个持仓的当前收益率（ROI）
+        - 如果 ROI <= -STOP_LOSS_PCT（即亏损达到止损百分比），触发全仓止损卖出
+        
+        成本计算说明：
+        - 多次买入：成本累加（每次买入都会累加成本）
+        - 按比例卖出（跟卖）：成本按比例减少（保持成本与持仓的对应关系）
+        - 止盈卖出：成本保持不变（用于追踪原始投入）
+        - 止损计算：使用剩余成本计算 ROI = (当前价值 / 剩余成本) - 1
+        
+        示例：
+        - 买入3次，每次0.1 SOL：总成本 = 0.3 SOL
+        - 跟卖50%：剩余成本 = 0.15 SOL（按比例减少）
+        - 止损计算：ROI = (当前价值 / 0.15 SOL) - 1
+        
+        止损策略：
+        - 止损时全仓卖出，不留仓位
+        - 止损后发送邮件通知
+        """
+        logger.info(f"🛡️ 止损监控线程已启动 (止损阈值: {STOP_LOSS_PCT * 100:.0f}%)...")
+        async with aiohttp.ClientSession(trust_env=False) as session:
+            while self.is_running:
+                if not self.portfolio:
+                    await asyncio.sleep(5)
+                    continue
+
+                # 复制一份 key 列表防止遍历时修改字典报错
+                for token_mint in list(self.portfolio.keys()):
+                    # 🔥🔥🔥 新增锁保护 🔥🔥🔥
+                    async with self.get_token_lock(token_mint):
+                        try:
+                            data = self.portfolio[token_mint]
+                            if data['my_balance'] <= 0: 
+                                continue
+
+                            # 询价
+                            quote = await self.trader.get_quote(
+                                session, token_mint, self.trader.SOL_MINT, data['my_balance']
+                            )
+
+                            if quote:
+                                curr_val_lamports = int(quote['outAmount'])
+                                # 🔥 修复：统一单位，将 lamports 转换为 SOL 数量
+                                curr_val_sol = curr_val_lamports / 10 ** 9
+                                cost_sol = data['cost_sol']
+                                my_balance = data['my_balance']
+                                
+                                # 🔥 计算剩余持仓的平均成本（考虑部分卖出后的成本调整）
+                                # 如果余额为0，跳过（理论上不应该发生，因为上面已经检查过）
+                                if my_balance <= 0:
+                                    continue
+                                
+                                # 计算收益率（统一使用 SOL 单位）
+                                # 使用剩余成本计算，反映剩余持仓的真实盈亏情况
+                                roi = (curr_val_sol / cost_sol) - 1 if cost_sol > 0 else 0
+                                
+                                # 记录当前持仓信息（用于日志）
+                                logger.debug(
+                                    f"📊 [止损监控] {token_mint[:6]}... | "
+                                    f"当前价值: {curr_val_sol:.4f} SOL | "
+                                    f"剩余成本: {cost_sol:.4f} SOL | "
+                                    f"剩余余额: {my_balance} | "
+                                    f"当前ROI: {roi * 100:.1f}%"
+                                )
+
+                                # 🔥 触发止损阈值 (亏损达到 STOP_LOSS_PCT)
+                                if roi <= -STOP_LOSS_PCT:
+                                    logger.warning(
+                                        f"🛑 [止损触发] {token_mint[:6]}... 亏损达到 {roi * 100:.1f}% "
+                                        f"(止损阈值: {STOP_LOSS_PCT * 100:.0f}%)！执行全仓止损卖出...")
+
+                                    # 止损策略：全仓卖出，不留仓位
+                                    amount_to_sell = data['my_balance']
+
+                                    # 执行卖出
+                                    # 🔥 修复：使用关键字参数，避免参数顺序错误
+                                    success, est_sol_out = await self.trader.execute_swap(
+                                        input_mint=token_mint,
+                                        output_mint=self.trader.SOL_MINT,
+                                        amount_lamports=amount_to_sell,
+                                        slippage_bps=SLIPPAGE_SELL
+                                    )
+
+                                    if success:
+                                        # 止损逻辑：全仓卖出，删除持仓记录
+                                        my_holdings_before = data['my_balance']
+                                        cost_before = data['cost_sol']
+                                        
+                                        # 删除持仓记录（成本归零）
+                                        if token_mint in self.portfolio:
+                                            del self.portfolio[token_mint]
+                                        
+                                        # 更新卖出计数缓存
+                                        self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
+                                        
+                                        # 重置买入计数（止损后可以重新买入）
+                                        if token_mint in self.buy_counts_cache:
+                                            del self.buy_counts_cache[token_mint]
+                                        
+                                        logger.info(
+                                            f"🛑 [止损完成] {token_mint[:6]}... 已全仓止损卖出 | "
+                                            f"卖出数量: {my_holdings_before} | "
+                                            f"成本: {cost_before:.4f} SOL"
+                                        )
+
+                                        # 尝试关闭账户回收租金
+                                        logger.info(f"🧹 正在尝试回收账户租金...")
+                                        await asyncio.sleep(2)
+                                        async def safe_close_account():
+                                            try:
+                                                await self.trader.close_token_account(token_mint)
+                                            except Exception as e:
+                                                logger.error(f"⚠️ 关闭账户失败: {e}")
+                                        asyncio.create_task(safe_close_account())
+
+                                        self._save_portfolio()
+                                        # 🔥 修复：将 lamports 转换为 SOL 单位
+                                        est_sol_out_sol = est_sol_out / 10 ** 9
+                                        self._record_history("SELL_STOP_LOSS", token_mint, amount_to_sell, est_sol_out_sol)
+
+                                        # 🔥🔥🔥【止损邮件通知】🔥🔥🔥
+                                        try:
+                                            # A. 算总账（计算该币种全生命周期的盈亏）
+                                            token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
+                                            
+                                            # 累计总投入 (BUY)
+                                            total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
+                                            
+                                            # 累计总回收 (SELL) - 包含刚才那一笔
+                                            total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action'])
+                                            
+                                            # 净利润 & 收益率
+                                            net_profit = total_sell_sol - total_buy_sol
+                                            final_roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
+                                            
+                                            # B. 生成交易历史表格
+                                            trade_table = self._generate_trade_history_table(token_mint)
+
+                                            subject = f"🛑 【止损报告】{token_mint[:4]}... 亏损: {net_profit:+.4f} SOL ({final_roi:+.1f}%)"
+
+                                            msg = f"""
+========================================
+       🛡️ SmartFlow 止损执行报告
+========================================
+
+代币地址: {token_mint}
+触发原因: 亏损达到止损阈值 ({STOP_LOSS_PCT * 100:.0f}%)
+执行动作: 全仓止损卖出
+
+📊 【最终财务统计】
+----------------------------------------
+💰 总投入本金:  {total_buy_sol:.4f} SOL
+💵 总回收资金:  {total_sell_sol:.4f} SOL
+----------------------------------------
+🔥 净利润 (PnL): {net_profit:+.4f} SOL
+📉 最终回报率:  {final_roi:+.2f}%
+
+📝 【完整操作复盘】
+{trade_table}
+
+(本邮件由 SmartFlow 自动生成，账户已自动关闭)
+"""
+                                            async def safe_send_email():
+                                                try:
+                                                    await send_email_async(subject, msg)
+                                                except Exception as e:
+                                                    logger.error(f"⚠️ 邮件发送失败: {e}")
+                                            asyncio.create_task(safe_send_email())
+                                            
+                                        except Exception as e:
+                                            logger.error(f"构建止损邮件失败: {e}")
+
+                                        # 稍微休息一下，防止针对同一个币疯狂触发
+                                        await asyncio.sleep(60)
+                                else:
+                                    # 未触发止损，记录当前亏损情况（仅调试用）
+                                    if roi < 0:
+                                        logger.debug(
+                                            f"📊 [持仓监控] {token_mint[:6]}... 当前亏损: {roi * 100:.1f}% "
+                                            f"(止损阈值: {STOP_LOSS_PCT * 100:.0f}%)"
+                                        )
+
+                        except Exception as e:
+                            logger.error(f"止损监控异常: {e}")
 
                 await asyncio.sleep(10)
 

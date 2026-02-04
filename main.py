@@ -175,6 +175,7 @@ async def main():
 
     await asyncio.gather(
         pm.monitor_1000x_profit(),
+        pm.monitor_stop_loss(),
         pm.monitor_sync_positions(),
         pm.schedule_daily_report(),
         start_monitor(process_tx_task, pm)

@@ -38,6 +38,9 @@ TAKE_PROFIT_ROI = float(os.getenv("TAKE_PROFIT_ROI", 10.0))
 # 🔥 新增：止盈卖出比例 (默认 0.5 即 50%)
 TAKE_PROFIT_SELL_PCT = float(os.getenv("TAKE_PROFIT_SELL_PCT", 0.5))
 
+# 🛡️ 止损百分比 (默认 0.5 即 50%，当亏损达到此比例时触发止损)
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", 0.5))
+
 # --- 风控配置 ---
 MIN_LIQUIDITY_USD = int(os.getenv("MIN_LIQUIDITY_USD", 3000))           
 MAX_FDV = int(os.getenv("MAX_FDV", 5000000))                            

@@ -847,7 +847,9 @@ class WalletAnalyzerV2:
             "hold_periods": [],  # 持仓周期列表：[[start_time, end_time], ...]
             "current_position": 0.0,  # 当前持仓数量
             "current_period_start": 0,  # 当前持仓周期的开始时间
-            "transactions": []  # 记录每笔交易的详细信息
+            "transactions": [],  # 记录每笔交易的详细信息
+            "buy_count": 0,  # 买入次数
+            "sell_count": 0  # 卖出次数
         })
         
         # 按时间正序处理交易（从最早到最新），这样才能正确跟踪持仓状态
@@ -882,8 +884,14 @@ class WalletAnalyzerV2:
                     # 更新 SOL 成本/收益
                     if mint in buy_attributions:
                         projects[mint]["buy_sol"] += buy_attributions[mint]
+                        # 统计买入次数（只有当买入金额大于0时才计数）
+                        if buy_attributions[mint] > 1e-9:
+                            projects[mint]["buy_count"] += 1
                     if mint in sell_attributions:
                         projects[mint]["sell_sol"] += sell_attributions[mint]
+                        # 统计卖出次数（只有当卖出金额大于0时才计数）
+                        if sell_attributions[mint] > 1e-9:
+                            projects[mint]["sell_count"] += 1
                     
                     # 跟踪持仓周期（用于正确计算持仓时间）
                     prev_position = projects[mint]["current_position"]
@@ -1090,7 +1098,9 @@ class WalletAnalyzerV2:
                 "remaining_tokens": remaining_tokens,  # 剩余代币数量
                 "unrealized_sol": unrealized_sol,  # 未实现收益（SOL）
                 "unsettled_cost": unsettled_cost,  # 未结算部分的成本
-                "is_unsettled": remaining_tokens > 0  # 是否未结算
+                "is_unsettled": remaining_tokens > 0,  # 是否未结算
+                "buy_count": data.get("buy_count", 0),  # 买入次数
+                "sell_count": data.get("sell_count", 0)  # 卖出次数
             })
         
         return {
@@ -1715,6 +1725,25 @@ async def main():
         persistence_dim = dims["persistence"]
         authenticity_dim = dims["authenticity"]
         
+        # 计算平均每次买入的SOL数量
+        all_buy_amounts = []
+        for r in results:
+            transactions = r.get("transactions", [])
+            for tx in transactions:
+                buy_sol = tx.get("buy_sol", 0)
+                if buy_sol > 1e-9:  # 只统计有效的买入金额
+                    all_buy_amounts.append(buy_sol)
+        avg_buy_sol = sum(all_buy_amounts) / len(all_buy_amounts) if all_buy_amounts else 0
+
+        # 计算已清仓代币的平均买入次数和卖出次数
+        settled_tokens = [r for r in results if not r.get('is_unsettled', False) and r.get('remaining_tokens', 0) == 0]
+        if settled_tokens:
+            avg_buy_count = sum(r.get('buy_count', 0) for r in settled_tokens) / len(settled_tokens)
+            avg_sell_count = sum(r.get('sell_count', 0) for r in settled_tokens) / len(settled_tokens)
+        else:
+            avg_buy_count = 0
+            avg_sell_count = 0
+
         print(f"📊 核心汇总:")
         print(f"   • 项目总数: {len(results)}")
         print(f"   • 胜率: {persistence_dim['win_rate']:.1%}")
@@ -1726,6 +1755,9 @@ async def main():
         print(f"   • 平均持仓: {authenticity_dim['avg_hold_time']:.1f} 分钟")
         print(f"   • 代币多样性: {authenticity_dim['unique_tokens']} 个")
         print(f"   • 30天交易: {persistence_dim['tokens_30d']} 个代币, {persistence_dim['tx_count_30d']} 笔")
+        print(f"   • 平均每次买入: {avg_buy_sol:.3f} SOL")
+        print(f"   • 已清仓代币平均买入次数: {avg_buy_count:.2f} 次")
+        print(f"   • 已清仓代币平均卖出次数: {avg_sell_count:.2f} 次")
         
         print("-" * 70)
         print(f"🎯 维度评分:")
