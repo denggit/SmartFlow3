@@ -16,7 +16,7 @@ import aiohttp
 
 # 导入配置和工具
 from config.settings import TARGET_WALLET, SLIPPAGE_SELL, TAKE_PROFIT_ROI, REPORT_HOUR, REPORT_MINUTE, \
-    TAKE_PROFIT_SELL_PCT
+    TAKE_PROFIT_SELL_PCT, USDC_MINT
 from services.notification import send_email_async
 from utils.logger import logger
 
@@ -513,61 +513,63 @@ class PortfolioManager:
                 current_time = time.time()
                 
                 for token_mint in list(self.portfolio.keys()):
-                    try:
-                        my_data = self.portfolio[token_mint]
-                        if my_data['my_balance'] <= 0: 
-                            continue
-
-                        # 🔥 新增：买入后保护期检查，避免链上数据同步延迟导致的误判
-                        last_buy_time = my_data.get('last_buy_time', 0)
-                        if last_buy_time > 0:
-                            time_since_buy = current_time - last_buy_time
-                            if time_since_buy < BUY_PROTECTION_TIME:
-                                remaining_protection = BUY_PROTECTION_TIME - time_since_buy
-                                logger.debug(
-                                    f"🛡️ [保护期] {token_mint[:6]}... 买入后 {time_since_buy:.1f} 秒，"
-                                    f"剩余保护时间 {remaining_protection:.1f} 秒，跳过检查"
-                                )
+                    # 🔥🔥🔥 新增锁保护 🔥🔥🔥
+                    async with self.get_token_lock(token_mint):
+                        try:
+                            my_data = self.portfolio[token_mint]
+                            if my_data['my_balance'] <= 0: 
                                 continue
-
-                        sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
-
-                        # 🔥 新增保护：如果获取失败(None)，认为是网络问题，直接跳过本次检查
-                        if sm_amount_raw is None:
-                            logger.warning(f"⚠️ [同步跳过] 无法获取大佬 {token_mint} 余额 (网络波动)")
-                            continue
-
-                        should_sell = False
-                        reason = ""
-
-                        if sm_amount_raw == 0:
-                            # 🔥 新增：即使检测到余额为0，也要再次确认（避免误判）
-                            # 等待2秒后再次检查，如果还是0，才触发清仓
-                            await asyncio.sleep(2)
-                            sm_amount_raw_retry = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
-                            if sm_amount_raw_retry is not None and sm_amount_raw_retry == 0:
-                                should_sell = True
-                                reason = "大佬余额为 0 (已二次确认)"
-                            else:
-                                logger.info(
-                                    f"✅ [误判恢复] {token_mint[:6]}... 首次检测为0，二次确认后余额: {sm_amount_raw_retry}"
-                                )
-                        else:
-                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
-                                                                sm_amount_raw)
-                            if quote:
-                                val_in_sol = int(quote['outAmount']) / 10 ** 9
-                                if val_in_sol < 0.05:
+    
+                            # 🔥 新增：买入后保护期检查，避免链上数据同步延迟导致的误判
+                            last_buy_time = my_data.get('last_buy_time', 0)
+                            if last_buy_time > 0:
+                                time_since_buy = current_time - last_buy_time
+                                if time_since_buy < BUY_PROTECTION_TIME:
+                                    remaining_protection = BUY_PROTECTION_TIME - time_since_buy
+                                    logger.debug(
+                                        f"🛡️ [保护期] {token_mint[:6]}... 买入后 {time_since_buy:.1f} 秒，"
+                                        f"剩余保护时间 {remaining_protection:.1f} 秒，跳过检查"
+                                    )
+                                    continue
+    
+                            sm_amount_raw = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
+    
+                            # 🔥 新增保护：如果获取失败(None)，认为是网络问题，直接跳过本次检查
+                            if sm_amount_raw is None:
+                                logger.warning(f"⚠️ [同步跳过] 无法获取大佬 {token_mint} 余额 (网络波动)")
+                                continue
+    
+                            should_sell = False
+                            reason = ""
+    
+                            if sm_amount_raw == 0:
+                                # 🔥 新增：即使检测到余额为0，也要再次确认（避免误判）
+                                # 等待2秒后再次检查，如果还是0，才触发清仓
+                                await asyncio.sleep(2)
+                                sm_amount_raw_retry = await self.trader.get_token_balance_raw(TARGET_WALLET, token_mint)
+                                if sm_amount_raw_retry is not None and sm_amount_raw_retry == 0:
                                     should_sell = True
-                                    reason = f"大佬余额价值仅 {val_in_sol:.4f} SOL (判定为粉尘)"
-
-                        if should_sell:
-                            logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... | 原因: {reason}")
-                            logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
-                            await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)
-
-                    except Exception as e:
-                        logger.error(f"同步检查异常: {e}")
+                                    reason = "大佬余额为 0 (已二次确认)"
+                                else:
+                                    logger.info(
+                                        f"✅ [误判恢复] {token_mint[:6]}... 首次检测为0，二次确认后余额: {sm_amount_raw_retry}"
+                                    )
+                            else:
+                                quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
+                                                                    sm_amount_raw)
+                                if quote:
+                                    val_in_sol = int(quote['outAmount']) / 10 ** 9
+                                    if val_in_sol < 0.05:
+                                        should_sell = True
+                                        reason = f"大佬余额价值仅 {val_in_sol:.4f} SOL (判定为粉尘)"
+    
+                            if should_sell:
+                                logger.warning(f"😱 发现异常！持有 {token_mint[:6]}... | 原因: {reason}")
+                                logger.warning(f"🛡️ 触发防断网机制：立即强制清仓！")
+                                await self.force_sell_all(token_mint, my_data['my_balance'], -0.99)
+    
+                        except Exception as e:
+                            logger.error(f"同步检查异常: {e}")
 
                 await asyncio.sleep(20)
 
@@ -581,164 +583,166 @@ class PortfolioManager:
 
                 # 复制一份 key 列表防止遍历时修改字典报错
                 for token_mint in list(self.portfolio.keys()):
-                    try:
-                        data = self.portfolio[token_mint]
-                        if data['my_balance'] <= 0: continue
-
-                        # 询价
-                        quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
-                                                            data['my_balance'])
-
-                        if quote:
-                            curr_val_lamports = int(quote['outAmount'])
-                            # 🔥 修复：统一单位，将 lamports 转换为 SOL 数量
-                            curr_val_sol = curr_val_lamports / 10 ** 9
-                            cost_sol = data['cost_sol']
-                            # 计算收益率（统一使用 SOL 单位）
-                            roi = (curr_val_sol / cost_sol) - 1 if cost_sol > 0 else 0
-
-                            # 🔥 触发止盈阈值 (比如 1000%)
-                            if roi >= TAKE_PROFIT_ROI:
-                                logger.warning(
-                                    f"🚀 [暴富时刻] {token_mint} 收益率达到 {roi * 100:.0f}%！执行“留种”止盈策略...")
-
-                                # --- 核心修改：只卖 TAKE_PROFIT_SELL_PCT%，留剩余的和大哥共进退 ---
-                                amount_to_sell = int(data['my_balance'] * TAKE_PROFIT_SELL_PCT)
-
-                                # 如果剩下的太少(是粉尘)，干脆全卖了
-                                # 🔥 修复：使用配置的 TAKE_PROFIT_SELL_PCT 而不是硬编码 0.2
-                                remaining_ratio = 1 - TAKE_PROFIT_SELL_PCT
-                                est_val_remaining = (curr_val_lamports * remaining_ratio) / 10 ** 9
-                                is_clear_all = False
-
-                                if est_val_remaining < 0.01:  # 剩下的不值钱，全清
-                                    amount_to_sell = data['my_balance']
-                                    is_clear_all = True
-                                    logger.info("   -> 剩余价值过低，执行全仓止盈")
-                                else:
-                                    logger.info(
-                                        f"   -> 锁定 {TAKE_PROFIT_SELL_PCT * 100}% 利润，保留 {(1 - TAKE_PROFIT_SELL_PCT) * 100}% 博百倍金狗！")
-
-                                # 执行卖出
-                                # 🔥 修复：使用关键字参数，避免参数顺序错误
-                                success, est_sol_out = await self.trader.execute_swap(
-                                    input_mint=token_mint,
-                                    output_mint=self.trader.SOL_MINT,
-                                    amount_lamports=amount_to_sell,
-                                    slippage_bps=SLIPPAGE_SELL
-                                )
-
-                                if success:
-                                    # 🔥 止盈逻辑：只减少余额，不减少成本
-                                    # 原因：止盈是主动止盈，保留成本可以更好地追踪原始投入和真实收益率
-                                    # 只有完全清仓时，成本才会归零
-                                    my_holdings_before = self.portfolio[token_mint]['my_balance']
-                                    
-                                    # 先保存剩余仓位（在删除之前）
-                                    remaining_balance = my_holdings_before - amount_to_sell
-                                    
-                                    # 只减少余额，成本保持不变（用于追踪原始投入）
-                                    if my_holdings_before > 0:
-                                        self.portfolio[token_mint]['my_balance'] -= amount_to_sell
-                                        logger.info(
-                                            f"💰 [止盈记账] {token_mint[:6]}... 卖出部分止盈 | "
-                                            f"余额: {my_holdings_before} -> {self.portfolio[token_mint]['my_balance']} | "
-                                            f"成本保持: {self.portfolio[token_mint]['cost_sol']:.4f} SOL (用于追踪原始投入)"
-                                        )
+                    # 🔥🔥🔥 新增锁保护 🔥🔥🔥
+                    async with self.get_token_lock(token_mint):
+                        try:
+                            data = self.portfolio[token_mint]
+                            if data['my_balance'] <= 0: continue
+    
+                            # 询价
+                            quote = await self.trader.get_quote(session, token_mint, self.trader.SOL_MINT,
+                                                                data['my_balance'])
+    
+                            if quote:
+                                curr_val_lamports = int(quote['outAmount'])
+                                # 🔥 修复：统一单位，将 lamports 转换为 SOL 数量
+                                curr_val_sol = curr_val_lamports / 10 ** 9
+                                cost_sol = data['cost_sol']
+                                # 计算收益率（统一使用 SOL 单位）
+                                roi = (curr_val_sol / cost_sol) - 1 if cost_sol > 0 else 0
+    
+                                # 🔥 触发止盈阈值 (比如 1000%)
+                                if roi >= TAKE_PROFIT_ROI:
+                                    logger.warning(
+                                        f"🚀 [暴富时刻] {token_mint} 收益率达到 {roi * 100:.0f}%！执行“留种”止盈策略...")
+    
+                                    # --- 核心修改：只卖 TAKE_PROFIT_SELL_PCT%，留剩余的和大哥共进退 ---
+                                    amount_to_sell = int(data['my_balance'] * TAKE_PROFIT_SELL_PCT)
+    
+                                    # 如果剩下的太少(是粉尘)，干脆全卖了
+                                    # 🔥 修复：使用配置的 TAKE_PROFIT_SELL_PCT 而不是硬编码 0.2
+                                    remaining_ratio = 1 - TAKE_PROFIT_SELL_PCT
+                                    est_val_remaining = (curr_val_lamports * remaining_ratio) / 10 ** 9
+                                    is_clear_all = False
+    
+                                    if est_val_remaining < 0.01:  # 剩下的不值钱，全清
+                                        amount_to_sell = data['my_balance']
+                                        is_clear_all = True
+                                        logger.info("   -> 剩余价值过低，执行全仓止盈")
                                     else:
-                                        # 如果余额异常（理论上不应该发生），直接删除记录
-                                        logger.warning(f"⚠️ [异常] {token_mint[:6]}... 止盈卖出时余额异常 ({my_holdings_before})，直接清仓")
-                                        if token_mint in self.portfolio:
-                                            del self.portfolio[token_mint]
-                                        # 直接返回，不继续后续逻辑
+                                        logger.info(
+                                            f"   -> 锁定 {TAKE_PROFIT_SELL_PCT * 100}% 利润，保留 {(1 - TAKE_PROFIT_SELL_PCT) * 100}% 博百倍金狗！")
+    
+                                    # 执行卖出
+                                    # 🔥 修复：使用关键字参数，避免参数顺序错误
+                                    success, est_sol_out = await self.trader.execute_swap(
+                                        input_mint=token_mint,
+                                        output_mint=self.trader.SOL_MINT,
+                                        amount_lamports=amount_to_sell,
+                                        slippage_bps=SLIPPAGE_SELL
+                                    )
+    
+                                    if success:
+                                        # 🔥 止盈逻辑：只减少余额，不减少成本
+                                        # 原因：止盈是主动止盈，保留成本可以更好地追踪原始投入和真实收益率
+                                        # 只有完全清仓时，成本才会归零
+                                        my_holdings_before = self.portfolio[token_mint]['my_balance']
+                                        
+                                        # 先保存剩余仓位（在删除之前）
+                                        remaining_balance = my_holdings_before - amount_to_sell
+                                        
+                                        # 只减少余额，成本保持不变（用于追踪原始投入）
+                                        if my_holdings_before > 0:
+                                            self.portfolio[token_mint]['my_balance'] -= amount_to_sell
+                                            logger.info(
+                                                f"💰 [止盈记账] {token_mint[:6]}... 卖出部分止盈 | "
+                                                f"余额: {my_holdings_before} -> {self.portfolio[token_mint]['my_balance']} | "
+                                                f"成本保持: {self.portfolio[token_mint]['cost_sol']:.4f} SOL (用于追踪原始投入)"
+                                            )
+                                        else:
+                                            # 如果余额异常（理论上不应该发生），直接删除记录
+                                            logger.warning(f"⚠️ [异常] {token_mint[:6]}... 止盈卖出时余额异常 ({my_holdings_before})，直接清仓")
+                                            if token_mint in self.portfolio:
+                                                del self.portfolio[token_mint]
+                                            # 直接返回，不继续后续逻辑
+                                            self._save_portfolio()
+                                            # 🔥 修复：将 lamports 转换为 SOL 单位
+                                            est_sol_out_sol = est_sol_out / 10 ** 9
+                                            self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
+                                            return
+    
+                                        # 如果是全清，才删除数据和关账户（成本归零）
+                                        if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
+                                            if token_mint in self.portfolio:
+                                                del self.portfolio[token_mint]
+                                            remaining_balance = 0
+                                            # 🔥 修复：添加异常处理
+                                            async def safe_close_account():
+                                                try:
+                                                    await self.trader.close_token_account(token_mint)
+                                                except Exception as e:
+                                                    logger.error(f"⚠️ 关闭账户失败: {e}")
+                                            asyncio.create_task(safe_close_account())
+    
                                         self._save_portfolio()
                                         # 🔥 修复：将 lamports 转换为 SOL 单位
                                         est_sol_out_sol = est_sol_out / 10 ** 9
                                         self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
-                                        return
-
-                                    # 如果是全清，才删除数据和关账户（成本归零）
-                                    if is_clear_all or self.portfolio[token_mint]['my_balance'] <= 0:
-                                        if token_mint in self.portfolio:
-                                            del self.portfolio[token_mint]
-                                        remaining_balance = 0
-                                        # 🔥 修复：添加异常处理
-                                        async def safe_close_account():
-                                            try:
-                                                await self.trader.close_token_account(token_mint)
-                                            except Exception as e:
-                                                logger.error(f"⚠️ 关闭账户失败: {e}")
-                                        asyncio.create_task(safe_close_account())
-
-                                    self._save_portfolio()
-                                    # 🔥 修复：将 lamports 转换为 SOL 单位
-                                    est_sol_out_sol = est_sol_out / 10 ** 9
-                                    self._record_history("SELL_PROFIT", token_mint, amount_to_sell, est_sol_out_sol)
-
-                                    # 🔥🔥🔥【止盈邮件美化核心代码】🔥🔥🔥
-                                    try:
-                                        # 1. 计算本次止盈的财务数据
-                                        # 估算本次卖出部分的成本 (按比例分摊总成本)
-                                        total_cost = data['cost_sol'] # 总成本
-                                        # my_holdings_before 是卖出前的持仓量
-                                        cost_of_this_sell = 0.0
-                                        if my_holdings_before > 0:
-                                            cost_of_this_sell = total_cost * (amount_to_sell / my_holdings_before)
-                                        
-                                        # 本次落袋利润
-                                        realized_profit = est_sol_out_sol - cost_of_this_sell
-                                        
-                                        # 2. 计算剩余仓位的价值
-                                        # curr_val_lamports 是当前总价值，est_val_remaining 是剩余部分的价值
-                                        val_remaining_sol = est_val_remaining 
-                                        
-                                        # 3. 计算百分比
-                                        sell_pct = TAKE_PROFIT_SELL_PCT * 100
-                                        remain_pct = (1 - TAKE_PROFIT_SELL_PCT) * 100
-                                        
-                                        # 4. 生成历史表格
-                                        trade_table = self._generate_trade_history_table(token_mint)
-
-                                        subject = f"🚀 【暴富止盈】{token_mint[:4]}... 锁定利润 {realized_profit:+.4f} SOL"
-
-                                        msg = f"""
-========================================
-       🎉 SmartFlow 止盈锁定报告
-========================================
-
-代币地址: {token_mint}
-当前涨幅: {roi * 100:.1f}% (触发 1000% 止盈)
-
-💰 【本次锁定 (Pocket)】
-----------------------------------------
-🔨 卖出比例:  {sell_pct:.0f}%
-💵 到手资金:  {est_sol_out_sol:.4f} SOL
-🔥 本次净赚:  {realized_profit:+.4f} SOL (已落袋)
-
-💎 【剩余博弈 (Moonbag)】
-----------------------------------------
-📦 保留仓位:  {remain_pct:.0f}%
-🦄 当前价值:  {val_remaining_sol:.4f} SOL
-(成本已大幅收回，剩余仓位零风险格局！)
-
-📝 【交易流水】
-{trade_table}
-"""
-                                        async def safe_send_email():
-                                            try:
-                                                await send_email_async(subject, msg)
-                                            except Exception as e:
-                                                logger.error(f"⚠️ 邮件发送失败: {e}")
-                                        asyncio.create_task(safe_send_email())
-
-                                    except Exception as e:
-                                        logger.error(f"构建止盈邮件失败: {e}")
-
-                                    # 稍微休息一下，防止针对同一个币疯狂触发
-                                    await asyncio.sleep(60)
-
-                    except Exception as e:
-                        logger.error(f"盯盘异常: {e}")
+    
+                                        # 🔥🔥🔥【止盈邮件美化核心代码】🔥🔥🔥
+                                        try:
+                                            # 1. 计算本次止盈的财务数据
+                                            # 估算本次卖出部分的成本 (按比例分摊总成本)
+                                            total_cost = data['cost_sol'] # 总成本
+                                            # my_holdings_before 是卖出前的持仓量
+                                            cost_of_this_sell = 0.0
+                                            if my_holdings_before > 0:
+                                                cost_of_this_sell = total_cost * (amount_to_sell / my_holdings_before)
+                                            
+                                            # 本次落袋利润
+                                            realized_profit = est_sol_out_sol - cost_of_this_sell
+                                            
+                                            # 2. 计算剩余仓位的价值
+                                            # curr_val_lamports 是当前总价值，est_val_remaining 是剩余部分的价值
+                                            val_remaining_sol = est_val_remaining 
+                                            
+                                            # 3. 计算百分比
+                                            sell_pct = TAKE_PROFIT_SELL_PCT * 100
+                                            remain_pct = (1 - TAKE_PROFIT_SELL_PCT) * 100
+                                            
+                                            # 4. 生成历史表格
+                                            trade_table = self._generate_trade_history_table(token_mint)
+    
+                                            subject = f"🚀 【暴富止盈】{token_mint[:4]}... 锁定利润 {realized_profit:+.4f} SOL"
+    
+                                            msg = f"""
+    ========================================
+           🎉 SmartFlow 止盈锁定报告
+    ========================================
+    
+    代币地址: {token_mint}
+    当前涨幅: {roi * 100:.1f}% (触发 1000% 止盈)
+    
+    💰 【本次锁定 (Pocket)】
+    ----------------------------------------
+    🔨 卖出比例:  {sell_pct:.0f}%
+    💵 到手资金:  {est_sol_out_sol:.4f} SOL
+    🔥 本次净赚:  {realized_profit:+.4f} SOL (已落袋)
+    
+    💎 【剩余博弈 (Moonbag)】
+    ----------------------------------------
+    📦 保留仓位:  {remain_pct:.0f}%
+    🦄 当前价值:  {val_remaining_sol:.4f} SOL
+    (成本已大幅收回，剩余仓位零风险格局！)
+    
+    📝 【交易流水】
+    {trade_table}
+    """
+                                            async def safe_send_email():
+                                                try:
+                                                    await send_email_async(subject, msg)
+                                                except Exception as e:
+                                                    logger.error(f"⚠️ 邮件发送失败: {e}")
+                                            asyncio.create_task(safe_send_email())
+    
+                                        except Exception as e:
+                                            logger.error(f"构建止盈邮件失败: {e}")
+    
+                                        # 稍微休息一下，防止针对同一个币疯狂触发
+                                        await asyncio.sleep(60)
+    
+                        except Exception as e:
+                            logger.error(f"盯盘异常: {e}")
 
                 await asyncio.sleep(10)
 
@@ -908,7 +912,7 @@ async def send_daily_summary(self):
         async with aiohttp.ClientSession(trust_env=True) as session:
             try:
                 # 1. 获取基础价格
-                usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                usdc_mint = USDC_MINT
                 quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
                 sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
 
