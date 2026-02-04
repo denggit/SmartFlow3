@@ -400,7 +400,9 @@ class PortfolioManager:
             self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
 
             # 🛡️ 只有在完全清仓时，才删除记录（成本归零）
-            if self.portfolio[token_mint]['my_balance'] < 100:
+            # 检查当前剩余持仓是否低于粉尘阈值 (100)
+            remaining_balance = self.portfolio[token_mint]['my_balance']
+            if remaining_balance < 100:
                 del self.portfolio[token_mint]
                 logger.info(f"✅ {token_mint[:6]}... 已清仓完毕（成本已归零）")
                 logger.info(f"🧹 正在尝试回收账户租金...")
@@ -412,6 +414,47 @@ class PortfolioManager:
                     except Exception as e:
                         logger.error(f"⚠️ 关闭账户失败: {e}")
                 asyncio.create_task(safe_close_account())
+                
+                # 2. 发送【清仓汇总】邮件
+                try:
+                    # 生成完整的交易历史表格
+                    trade_table = self._generate_trade_history_table(token_mint)
+                    
+                    # 计算这笔投资的总盈亏 (Total PnL)
+                    # 从 trade_history 中筛选出该代币的所有买入和卖出
+                    token_trades = [r for r in self.trade_history if r.get('token') == token_mint]
+                    total_buy_sol = sum(r['value_sol'] for r in token_trades if r['action'] == 'BUY')
+                    total_sell_sol = sum(r['value_sol'] for r in token_trades if 'SELL' in r['action'])
+                    net_profit = total_sell_sol - total_buy_sol
+                    roi = (net_profit / total_buy_sol * 100) if total_buy_sol > 0 else 0
+                    
+                    status_emoji = "🚀" if net_profit > 0 else "💸"
+                    
+                    subject = f"{status_emoji} 清仓通知: {token_mint[:6]}... (盈亏 {net_profit:+.4f} SOL)"
+                    msg = (
+                        f"检测到持仓已全部卖出，本次跟单结束。\n\n"
+                        f"代币: {token_mint}\n"
+                        f"总投入: {total_buy_sol:.4f} SOL\n"
+                        f"总回收: {total_sell_sol:.4f} SOL\n"
+                        f"净利润: {net_profit:+.4f} SOL\n"
+                        f"收益率: {roi:+.1f}%\n\n"
+                        f"【完整交易复盘】\n{trade_table}"
+                    )
+                    
+                    # 异步发送
+                    async def safe_send_email():
+                        try:
+                            await send_email_async(subject, msg)
+                        except Exception as e:
+                            logger.error(f"⚠️ 邮件发送失败: {e}")
+                    asyncio.create_task(safe_send_email())
+                    
+                except Exception as e:
+                    logger.error(f"构建清仓邮件失败: {e}")
+            
+            else:
+                # 如果没清仓，只打印日志，不发邮件
+                logger.info(f"📉 [分批卖出] 本次卖出 {est_sol_out_sol:.4f} SOL，剩余持仓 {remaining_balance} (未清仓，不发邮件)")
 
             self._save_portfolio()
             # 🔥 修复：将 lamports 转换为 SOL 单位
