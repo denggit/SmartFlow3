@@ -418,10 +418,10 @@ class BatchAnalyzerV2:
 
             # 2. 解析代币项目（内部会调用 Jupiter API）
             # 注意：Helius和Jupiter之间不需要间隔，只有同一API之间需要间隔
-            # Jupiter API 的 Key 会在 PriceFetcher 内部通过 key_manager 获取
+            # 注意：parse_token_projects 目前不支持 jupiter_key_manager 参数
             try:
                 analysis_result = await self.analyzer.parse_token_projects(
-                    session, txs, address, jupiter_key_manager=self.jupiter_key_manager
+                    session, txs, address
                 )
             except Exception as e:
                 logger.warning(f"解析钱包 {address[:8]}... 代币项目失败: {e}")
