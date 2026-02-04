@@ -74,3 +74,6 @@ try:
 except ValueError:
     print(f"⚠️ [配置警告] DAILY_REPORT_TIME 格式错误 ({_daily_time_str})，重置为 09:00")
     REPORT_HOUR, REPORT_MINUTE = 9, 0
+
+# --- 币地址 ---
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
