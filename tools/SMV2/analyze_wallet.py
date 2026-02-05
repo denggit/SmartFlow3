@@ -261,6 +261,7 @@ class TransactionParser:
     def parse_transaction(self, tx: dict) -> Tuple[float, Dict[str, float], int]:
         """
         解析单笔交易，返回 SOL 净变动和代币变动
+        参考 monitor.py 的 parse_tx 逻辑处理 WSOL
         
         Args:
             tx: 交易数据字典
@@ -280,34 +281,58 @@ class TransactionParser:
             timestamp = int(timestamp_raw / 1000)
         else:
             timestamp = int(timestamp_raw)
+        
+        token_transfers = tx.get('tokenTransfers', [])
+        native_transfers = tx.get('nativeTransfers', [])
+        
         native_sol_change = 0.0
         wsol_change = 0.0
         token_changes = defaultdict(float)
         
-        # 1. 统计原生 SOL 变动
-        for nt in tx.get('nativeTransfers', []):
-            if nt.get('fromUserAccount') == self.target_wallet:
-                native_sol_change -= nt.get('amount', 0) / 1e9
-            if nt.get('toUserAccount') == self.target_wallet:
-                native_sol_change += nt.get('amount', 0) / 1e9
-        
-        # 2. 统计 WSOL 和其他代币变动
-        for tt in tx.get('tokenTransfers', []):
-            mint = tt.get('mint', '')
-            amt = tt.get('tokenAmount', 0)
+        # --- 1. 处理 Token 转账（参考 monitor.py 的逻辑）---
+        for tx_transfer in token_transfers:
+            mint = tx_transfer.get('mint', '')
+            token_amount = tx_transfer.get('tokenAmount', 0)
             
+            # 🛡️ 特殊处理 WSOL：计入成本/收益，但不作为买卖目标
             if mint == self.wsol_mint:
-                if tt.get('fromUserAccount') == self.target_wallet:
-                    wsol_change -= amt
-                if tt.get('toUserAccount') == self.target_wallet:
-                    wsol_change += amt
-            else:
-                if tt.get('fromUserAccount') == self.target_wallet:
-                    token_changes[mint] -= amt
-                if tt.get('toUserAccount') == self.target_wallet:
-                    token_changes[mint] += amt
+                # Helius 的 tokenTransfers 通常已经是 Decimal 格式 (如 4.95)
+                # 不需要除以 1e9，直接使用
+                wsol_amount = float(token_amount)
+                
+                if tx_transfer.get('fromUserAccount') == self.target_wallet:
+                    wsol_change -= wsol_amount
+                elif tx_transfer.get('toUserAccount') == self.target_wallet:
+                    wsol_change += wsol_amount
+                continue
+            
+            # 处理其他代币（非 WSOL）
+            # 其他代币的 tokenAmount 格式处理（通常已经是小数格式）
+            # 注意：不同代币的 decimals 不同，但 Helius API 通常已经转换为小数格式
+            if tx_transfer.get('fromUserAccount') == self.target_wallet:
+                token_changes[mint] -= float(token_amount)
+            elif tx_transfer.get('toUserAccount') == self.target_wallet:
+                token_changes[mint] += float(token_amount)
         
-        # 3. 合并 SOL/WSOL，避免重复计算
+        # --- 2. 处理 Native SOL 转账（参考 monitor.py 的逻辑）---
+        sol_balance_change = 0
+        
+        for nt in native_transfers:
+            amount = nt.get('amount', 0)  # 这是 lamports
+            if nt.get('fromUserAccount') == self.target_wallet:
+                sol_balance_change -= amount
+            elif nt.get('toUserAccount') == self.target_wallet:
+                sol_balance_change += amount
+        
+        # 转换为 SOL（lamports 转 SOL）
+        native_sol_change = sol_balance_change / 1e9
+        
+        # --- 3. 合并 SOL/WSOL，避免重复计算（参考 monitor.py 的逻辑）---
+        # 核心计算逻辑：取最大值防止双重计算
+        # 场景 A (纯SOL买): Native花费 5, WSOL花费 0 -> Cost 5
+        # 场景 B (Wrap+Swap): Native花费 5(去Wrap), WSOL花费 5(去Swap) -> Cost 5 (取 Max)
+        # 场景 C (纯WSOL买): Native花费 0, WSOL花费 5 -> Cost 5
+        # 注意：这里需要处理双向变动（正数和负数）
         sol_change = self._merge_sol_changes(native_sol_change, wsol_change)
         
         return sol_change, dict(token_changes), timestamp
@@ -315,25 +340,44 @@ class TransactionParser:
     def _merge_sol_changes(self, native_sol: float, wsol: float) -> float:
         """
         合并原生 SOL 和 WSOL 变动，避免重复计算
+        参考 monitor.py 的 parse_tx 逻辑：取最大值防止双重计算
         
         Args:
-            native_sol: 原生 SOL 变动
-            wsol: WSOL 变动
+            native_sol: 原生 SOL 变动（正数表示增加，负数表示减少）
+            wsol: WSOL 变动（正数表示增加，负数表示减少）
             
         Returns:
             合并后的 SOL 净变动
         """
+        # 如果其中一个为 0，直接返回另一个
         if abs(native_sol) < 1e-9:
             return wsol
         if abs(wsol) < 1e-9:
             return native_sol
         
-        # 同向变动：可能是包装/解包操作，取绝对值较大的
-        if native_sol * wsol > 0:
-            return native_sol if abs(native_sol) > abs(wsol) else wsol
+        # 🔥 核心计算逻辑：取最大值防止双重计算（参考 monitor.py）
+        # 场景 A (纯SOL买): Native花费 -5, WSOL花费 0 -> Change -5
+        # 场景 B (Wrap+Swap): Native花费 -5(去Wrap), WSOL花费 -5(去Swap) -> Change -5 (取 Max，即更负的)
+        # 场景 C (纯WSOL买): Native花费 0, WSOL花费 -5 -> Change -5
+        # 场景 D (纯SOL卖): Native收入 +5, WSOL收入 0 -> Change +5
+        # 场景 E (Unwrap+Swap): Native收入 +5(从Unwrap), WSOL收入 +5(从Swap) -> Change +5 (取 Max，即更大的)
         
-        # 反向变动：正常交易，直接相加
-        return native_sol + wsol
+        if native_sol * wsol > 0:
+            # 同向变动：可能是包装/解包操作，取绝对值较大的
+            # 如果都是负数（支出），取绝对值较大的（即更负的，类似 monitor.py 的 max 逻辑）
+            # 如果都是正数（收入），取较大的
+            if native_sol < 0 and wsol < 0:
+                # 都是支出，取绝对值较大的（即更负的）
+                # 例如：-5 和 -3，取 -5（绝对值更大）
+                return max(native_sol, wsol)
+            else:
+                # 都是收入，取较大的
+                # 例如：+5 和 +3，取 +5
+                return max(native_sol, wsol)
+        else:
+            # 反向变动：正常交易，直接相加
+            # 例如：Native -5（支出），WSOL +3（收入），净变动 = -2
+            return native_sol + wsol
 
 
 class TokenAttributionCalculator:
