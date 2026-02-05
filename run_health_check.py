@@ -143,7 +143,7 @@ async def test_portfolio_manager():
         pm = PortfolioManager(trader)
 
         # 这个操作现在只会写到垃圾文件里
-        pm.add_position("TEST_TOKEN_JUP", 1000, 0.1)
+        await pm.add_position("TEST_TOKEN_JUP", 1000, 0.1)
 
         # 稍微给一点时间让后台线程完成写入 (这是新版改动引入的特性)
         await asyncio.sleep(0.5) 

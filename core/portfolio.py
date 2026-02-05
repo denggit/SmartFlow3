@@ -148,8 +148,19 @@ class PortfolioManager:
                     old_balance = self.portfolio[token_mint]['my_balance']
                     diff = real_balance - old_balance
 
-                    # 只有偏差超过 1% 时才修正
-                    if abs(diff) > (old_balance * 0.01):
+                    # 🔥 修复：处理 old_balance == 0 的情况
+                    # 如果账本余额为0但链上有余额，或者偏差超过1%，都需要修正
+                    should_correct = False
+                    if old_balance == 0:
+                        # 如果账本为0但链上有余额，直接修正
+                        if real_balance > 0:
+                            should_correct = True
+                    else:
+                        # 如果账本不为0，检查偏差是否超过1%
+                        if abs(diff) > (old_balance * 0.01):
+                            should_correct = True
+                    
+                    if should_correct:
                         logger.warning(
                             f"⚖️ [余额修正] {token_mint[:6]}... "
                             f"账本: {old_balance} -> 链上: {real_balance} | "
@@ -162,18 +173,18 @@ class PortfolioManager:
 
                         # 2. 🔥🔥🔥 [新增] 同步修正历史记录，防止日报数据错乱 🔥🔥🔥
                         if diff < 0:
-                            # 如果币变少了（滑点/税），记为一笔“0收入的卖出”
+                            # 如果币变少了（滑点/税），记为一笔"0收入的卖出"
                             # 这样统计程序就会把这部分成本算作亏损（Realized Loss），账也就平了
                             amount_lost = abs(diff)
                             self._record_history("SELL_CORRECTION", token_mint, amount_lost, 0.0)
                             logger.info(f"📉 [历史修正] 已记录 {amount_lost} 个代币的损耗 (滑点/税)")
 
                         elif diff > 0:
-                            # 如果币变多了（极少见，可能是分红/空投），记为一笔“0成本的买入”
+                            # 如果币变多了（极少见，可能是分红/空投），记为一笔"0成本的买入"
                             self._record_history("BUY", token_mint, diff, 0.0)
                             logger.info(f"📈 [历史修正] 已记录 {diff} 个代币的增量")
     
-    def add_position(self, token_mint, amount_bought, cost_sol):
+    async def add_position(self, token_mint, amount_bought, cost_sol):
         """
         添加持仓记录
         
@@ -182,21 +193,28 @@ class PortfolioManager:
             amount_bought: 买入数量
             cost_sol: 成本（SOL）
         """
-        if token_mint not in self.portfolio:
-            self.portfolio[token_mint] = {'my_balance': 0, 'cost_sol': 0}
+        # 🔥 修复：添加输入验证
+        if amount_bought <= 0 or cost_sol < 0:
+            logger.error(f"❌ [输入验证失败] {token_mint[:6]}... 买入数量: {amount_bought}, 成本: {cost_sol}")
+            return
+        
+        # 🔥 修复：添加锁保护，确保并发安全
+        async with self.get_token_lock(token_mint):
+            if token_mint not in self.portfolio:
+                self.portfolio[token_mint] = {'my_balance': 0, 'cost_sol': 0}
 
-        self.portfolio[token_mint]['my_balance'] += amount_bought
-        self.portfolio[token_mint]['cost_sol'] += cost_sol
-        # 🔥 新增：记录买入时间戳，用于防止链上数据同步延迟导致的误判
-        self.portfolio[token_mint]['last_buy_time'] = time.time()
+            self.portfolio[token_mint]['my_balance'] += amount_bought
+            self.portfolio[token_mint]['cost_sol'] += cost_sol
+            # 🔥 新增：记录买入时间戳，用于防止链上数据同步延迟导致的误判
+            self.portfolio[token_mint]['last_buy_time'] = time.time()
 
-        # 更新缓存
-        self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
+            # 更新缓存
+            self.buy_counts_cache[token_mint] = self.buy_counts_cache.get(token_mint, 0) + 1
 
-        self._save_portfolio()
-        self._record_history("BUY", token_mint, amount_bought, cost_sol)
-        logger.info(
-            f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']} | 第 {self.buy_counts_cache[token_mint]} 次买入")
+            self._save_portfolio()
+            self._record_history("BUY", token_mint, amount_bought, cost_sol)
+            logger.info(
+                f"📝 [记账] 新增持仓 {token_mint[:6]}... | 数量: {self.portfolio[token_mint]['my_balance']} | 第 {self.buy_counts_cache[token_mint]} 次买入")
 
     def get_buy_counts(self, token_mint):
         """
@@ -314,14 +332,20 @@ class PortfolioManager:
         return "\n".join(table_lines)
 
     async def execute_proportional_sell(self, token_mint, smart_money_sold_amt):
-        # 1. 检查持仓
-        if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
-            return
-        
         # 🔥 修复：检查卖出数量是否有效
         if smart_money_sold_amt is None or smart_money_sold_amt <= 0:
             logger.warning(f"⚠️ [卖出跳过] {token_mint[:6]}... 卖出数量无效: {smart_money_sold_amt}")
             return
+
+        # 🔥 修复：在锁保护下检查持仓
+        async with self.get_token_lock(token_mint):
+            # 1. 检查持仓
+            if token_mint not in self.portfolio or self.portfolio[token_mint]['my_balance'] <= 0:
+                return
+            
+            my_holdings = self.portfolio[token_mint]['my_balance']
+            total_buys = self.get_buy_counts(token_mint)
+            current_sell_seq = self.get_sell_counts(token_mint) + 1
 
         logger.info(f"👀 监测到大佬卖出 {token_mint[:6]}... 正在计算策略...")
 
@@ -348,11 +372,14 @@ class PortfolioManager:
                 is_force_clear = True
                 sell_ratio = 1.0
                 reason_msg = f"(卖出比例 {original_sell_ratio:.1%} > 90% -> 触发清仓)"
+        else:
+            # 🔥 修复：如果 total_before_sell == 0，说明大佬已经完全清仓，我们也应该清仓
+            logger.warning(f"⚠️ [卖出判断] {token_mint[:6]}... 大佬总持仓为0，触发清仓")
+            is_force_clear = True
+            sell_ratio = 1.0
+            reason_msg = "(大佬总持仓为0 -> 触发清仓)"
 
         # 3. 策略 B：回合制 + 试盘过滤
-        total_buys = self.get_buy_counts(token_mint)
-        current_sell_seq = self.get_sell_counts(token_mint) + 1
-
         is_tiny_sell = sell_ratio < 0.05
 
         # 只有当还没有触发清仓时，才去检查回合制逻辑
@@ -376,18 +403,25 @@ class PortfolioManager:
                 reason_msg = f"(第 {current_sell_seq} 次 - 试盘跟随)"
 
         # 4. 计算最终卖出数量
-        my_holdings = self.portfolio[token_mint]['my_balance']
-        amount_to_sell = 0
+        # 🔥 修复：在锁保护下重新获取持仓（可能已被其他线程修改）
+        async with self.get_token_lock(token_mint):
+            if token_mint not in self.portfolio:
+                logger.warning(f"⚠️ [卖出跳过] {token_mint[:6]}... 持仓已被清仓")
+                return
+            
+            my_holdings = self.portfolio[token_mint]['my_balance']
+            amount_to_sell = 0
 
-        if is_force_clear:
-            # 强制清仓模式 (整数操作，无浮点误差)
-            amount_to_sell = my_holdings
-            sell_ratio = 1.0
-        else:
-            # 正常比例跟单模式 (含试盘跟随)
-            amount_to_sell = int(my_holdings * sell_ratio)
+            if is_force_clear:
+                # 强制清仓模式 (整数操作，无浮点误差)
+                amount_to_sell = my_holdings
+                sell_ratio = 1.0
+            else:
+                # 正常比例跟单模式 (含试盘跟随)
+                amount_to_sell = int(my_holdings * sell_ratio)
 
-        if amount_to_sell < 100: return
+            if amount_to_sell < 100:
+                return
 
         # 🔥🔥🔥 防粉尘卖出 (Gas Protection) 🔥🔥🔥
         async with aiohttp.ClientSession() as session:
@@ -417,10 +451,19 @@ class PortfolioManager:
         )
 
         if success:
-            # 🔥 跟卖逻辑：按比例减少余额和成本
-            # 原因：跟卖是跟随大佬卖出，应该按比例减少成本，保持成本与持仓的对应关系
-            my_holdings_before = self.portfolio[token_mint]['my_balance']
-            cost_before = self.portfolio[token_mint]['cost_sol']
+            # 🔥 修复：在锁保护下更新持仓
+            async with self.get_token_lock(token_mint):
+                # 再次检查持仓是否存在（可能已被其他线程清仓）
+                if token_mint not in self.portfolio:
+                    logger.warning(f"⚠️ [卖出跳过] {token_mint[:6]}... 持仓已被清仓")
+                    est_sol_out_sol = est_sol_out / 10 ** 9
+                    self._record_history("SELL", token_mint, amount_to_sell, est_sol_out_sol)
+                    return
+                
+                # 🔥 跟卖逻辑：按比例减少余额和成本
+                # 原因：跟卖是跟随大佬卖出，应该按比例减少成本，保持成本与持仓的对应关系
+                my_holdings_before = self.portfolio[token_mint]['my_balance']
+                cost_before = self.portfolio[token_mint]['cost_sol']
             
             if my_holdings_before > 0:
                 # 计算卖出比例
@@ -1020,6 +1063,16 @@ class PortfolioManager:
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
+        # 🔥 修复：在锁保护下检查并获取持仓
+        async with self.get_token_lock(token_mint):
+            if token_mint not in self.portfolio:
+                logger.warning(f"⚠️ [强平跳过] {token_mint[:6]}... 持仓不存在")
+                return
+            
+            # 使用账本中的余额作为默认值
+            if amount <= 0:
+                amount = self.portfolio[token_mint].get('my_balance', 0)
+        
         # 🔥 [新增] 在强平前，最后确认一次真实余额
         # 防止传入的 amount 是旧账本数据，导致卖出失败
         try:
@@ -1029,11 +1082,16 @@ class PortfolioManager:
                 logger.info(f"🛡️ [强平修正] 使用链上真实余额: {amount}")
             elif real_balance == 0:
                 logger.warning(f"⚠️ [强平取消] 链上余额为 0，无需卖出")
-                if token_mint in self.portfolio:
-                    del self.portfolio[token_mint]
+                async with self.get_token_lock(token_mint):
+                    if token_mint in self.portfolio:
+                        del self.portfolio[token_mint]
                 return
         except Exception as e:
             logger.warning(f"⚠️ 强平前同步失败: {e} (将尝试使用账本余额)")
+        
+        if amount <= 0:
+            logger.warning(f"⚠️ [强平跳过] {token_mint[:6]}... 卖出数量为0")
+            return
             
         # 🔥 修复：使用关键字参数，确保参数正确传递
         success, est_sol_out = await self.trader.execute_swap(
@@ -1043,11 +1101,13 @@ class PortfolioManager:
             slippage_bps=SLIPPAGE_SELL
         )
         if success:
-            if token_mint in self.portfolio:
-                del self.portfolio[token_mint]
+            # 🔥 修复：在锁保护下更新持仓
+            async with self.get_token_lock(token_mint):
+                if token_mint in self.portfolio:
+                    del self.portfolio[token_mint]
 
-            # 更新卖出计数 (防止逻辑混乱，强平也算一次卖出)
-            self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
+                # 更新卖出计数 (防止逻辑混乱，强平也算一次卖出)
+                self.sell_counts_cache[token_mint] = self.sell_counts_cache.get(token_mint, 0) + 1
 
             logger.info(f"🧹 [强平] 正在尝试回收账户租金...")
             await asyncio.sleep(2)
@@ -1195,14 +1255,19 @@ class PortfolioManager:
             "sell_count": sum(1 for x in history_snapshot if 'SELL' in x['action'])
         }
 
-async def send_daily_summary(self):
+    async def send_daily_summary(self):
         logger.info("📊 正在生成每日日报...")
         async with aiohttp.ClientSession(trust_env=True) as session:
             try:
                 # 1. 获取基础价格
                 usdc_mint = USDC_MINT
                 quote = await self.trader.get_quote(session, self.trader.SOL_MINT, usdc_mint, 1 * 10 ** 9)
-                sol_price = float(quote['outAmount']) / 10 ** 6 if quote else 0
+                # 🔥 修复：如果 quote 为 None，使用默认价格或跳过
+                if quote is None:
+                    logger.warning("⚠️ 无法获取 SOL 价格，使用默认价格 $150")
+                    sol_price = 150.0
+                else:
+                    sol_price = float(quote['outAmount']) / 10 ** 6
 
                 balance_resp = await self.trader.rpc_client.get_balance(self.trader.payer.pubkey())
                 sol_balance = balance_resp.value / 10 ** 9
@@ -1223,7 +1288,12 @@ async def send_daily_summary(self):
                             holdings_count += 1
                             # 询价
                             q = await self.trader.get_quote(session, mint, self.trader.SOL_MINT, qty)
-                            val = int(q['outAmount']) / 10 ** 9 if q else 0
+                            # 🔥 修复：如果报价失败，使用成本作为估值（避免计算错误）
+                            if q is None:
+                                logger.warning(f"⚠️ 无法获取 {mint[:6]}... 报价，使用成本作为估值")
+                                val = cost
+                            else:
+                                val = int(q['outAmount']) / 10 ** 9
                             
                             # 累加数据
                             holdings_val_sol += val

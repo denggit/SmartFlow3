@@ -137,7 +137,7 @@ async def process_tx_task(session, signature, pm: PortfolioManager):
                     # 🔥 修复：cost_sol 应该是 SOL 数量，不是 lamports
                     # 先记录买入次数，判断是否为第一次买入
                     buy_times_before = pm.get_buy_counts(token)
-                    pm.add_position(token, est_out, COPY_AMOUNT_SOL)
+                    await pm.add_position(token, est_out, COPY_AMOUNT_SOL)
                     logger.info(f"✅ 跟单成功: {token} | 预计获得: {est_out} | 仓位已记录")
 
                     # 🔥🔥🔥 [新增] 延迟 2 秒后强制同步真实余额 🔥🔥🔥
