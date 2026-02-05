@@ -986,6 +986,21 @@ class PortfolioManager:
                 await asyncio.sleep(10)
 
     async def force_sell_all(self, token_mint, amount, roi):
+        # 🔥 [新增] 在强平前，最后确认一次真实余额
+        # 防止传入的 amount 是旧账本数据，导致卖出失败
+        try:
+            real_balance = await self.trader.get_token_balance_raw(str(self.trader.payer.pubkey()), token_mint)
+            if real_balance is not None and real_balance > 0:
+                amount = real_balance # 用真实余额覆盖传入的 amount
+                logger.info(f"🛡️ [强平修正] 使用链上真实余额: {amount}")
+            elif real_balance == 0:
+                logger.warning(f"⚠️ [强平取消] 链上余额为 0，无需卖出")
+                if token_mint in self.portfolio:
+                    del self.portfolio[token_mint]
+                return
+        except Exception as e:
+            logger.warning(f"⚠️ 强平前同步失败: {e} (将尝试使用账本余额)")
+            
         # 🔥 修复：使用关键字参数，确保参数正确传递
         success, est_sol_out = await self.trader.execute_swap(
             input_mint=token_mint,
