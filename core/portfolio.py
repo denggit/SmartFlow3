@@ -132,33 +132,46 @@ class PortfolioManager:
         self.trade_history.append(record)
         self._save_history()
 
-    # 📋 建议放在 add_position 方法之前
+        # core/portfolio.py
+
     async def sync_real_balance(self, token_mint):
         """
         🔥 [核心修复] 强制从链上同步真实余额
         解决：变基、通缩、高滑点导致的"虚空记账"问题
         """
-        # 1. 获取你的钱包地址 (不是 Smart Money 的!)
         my_wallet_address = str(self.trader.payer.pubkey())
-        
-        # 2. 查链上真实余额
         real_balance = await self.trader.get_token_balance_raw(my_wallet_address, token_mint)
-        
+
         if real_balance is not None:
-            # 加锁防止冲突
             async with self.get_token_lock(token_mint):
                 if token_mint in self.portfolio:
                     old_balance = self.portfolio[token_mint]['my_balance']
-                    
-                    # 只有偏差超过 1% 时才修正 (避免RPC微小抖动)
-                    if abs(real_balance - old_balance) > (old_balance * 0.01):
+                    diff = real_balance - old_balance
+
+                    # 只有偏差超过 1% 时才修正
+                    if abs(diff) > (old_balance * 0.01):
                         logger.warning(
                             f"⚖️ [余额修正] {token_mint[:6]}... "
                             f"账本: {old_balance} -> 链上: {real_balance} | "
-                            f"修正原因: 滑点/税/通缩"
+                            f"修正差额: {diff}"
                         )
+
+                        # 1. 更新当前持仓
                         self.portfolio[token_mint]['my_balance'] = real_balance
                         self._save_portfolio()
+
+                        # 2. 🔥🔥🔥 [新增] 同步修正历史记录，防止日报数据错乱 🔥🔥🔥
+                        if diff < 0:
+                            # 如果币变少了（滑点/税），记为一笔“0收入的卖出”
+                            # 这样统计程序就会把这部分成本算作亏损（Realized Loss），账也就平了
+                            amount_lost = abs(diff)
+                            self._record_history("SELL_CORRECTION", token_mint, amount_lost, 0.0)
+                            logger.info(f"📉 [历史修正] 已记录 {amount_lost} 个代币的损耗 (滑点/税)")
+
+                        elif diff > 0:
+                            # 如果币变多了（极少见，可能是分红/空投），记为一笔“0成本的买入”
+                            self._record_history("BUY", token_mint, diff, 0.0)
+                            logger.info(f"📈 [历史修正] 已记录 {diff} 个代币的增量")
     
     def add_position(self, token_mint, amount_bought, cost_sol):
         """
