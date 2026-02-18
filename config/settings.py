@@ -18,9 +18,14 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=ENV_PATH) 
 
 # --- API Keys ---
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-TARGET_WALLET = os.getenv("TARGET_WALLET")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+# 去除首尾空白，避免 .env 换行/空格导致私钥被截断
+def _strip_env(key, default=None):
+    v = os.getenv(key, default)
+    return v.strip() if isinstance(v, str) else v
+
+HELIUS_API_KEY = _strip_env("HELIUS_API_KEY")
+TARGET_WALLET = _strip_env("TARGET_WALLET")
+PRIVATE_KEY = _strip_env("PRIVATE_KEY")
 
 # --- 基础配置 ---
 WSS_ENDPOINT = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
