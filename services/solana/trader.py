@@ -39,14 +39,7 @@ class SolanaTrader:
         if not PRIVATE_KEY:
             raise ValueError("❌ 未找到私钥，请在 .env 或 config/settings.py 中配置 PRIVATE_KEY")
 
-        try:
-            self.payer = Keypair.from_base58_string(PRIVATE_KEY)
-        except Exception as e:
-            key_len = len(PRIVATE_KEY) if PRIVATE_KEY else 0
-            raise ValueError(
-                f"❌ PRIVATE_KEY 无效或长度异常 (当前长度 {key_len})。"
-                " Solana 私钥应为 Base58 格式、约 87–88 字符，请检查 .env 中是否完整且无换行/空格截断。"
-            ) from e
+        self.payer = Keypair.from_base58_string(PRIVATE_KEY)
         # 🔥 修复：使用官方新网关的正确路径 (/swap/v1/...)
         self.JUP_QUOTE_API = "https://api.jup.ag/swap/v1/quote"
         self.JUP_SWAP_API = "https://api.jup.ag/swap/v1/swap"
